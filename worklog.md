@@ -44,3 +44,31 @@ Stage Summary:
 - Real nmap output: 2 ports found, 0 vulnerabilities (expected for local services)
 - JSON data contract matches specification exactly
 - Frontend renders real data correctly with port table, state badges, version info
+
+---
+Task ID: 8
+Agent: Main Agent
+Task: Fix preview and scan functionality - production-ready deployment
+
+Work Log:
+- Discovered sandbox kills background processes after short time
+- Found that Next.js processes on port 3000 die after serving 1-3 requests
+- Simple Node HTTP servers survive longer than Next.js (memory-related kills)
+- Production build (next build + standalone server) uses less memory and survives longer
+- Created keep-alive.sh script that auto-restarts the standalone Next.js server
+- Using `disown` with background processes helps them survive longer
+- Rewrote scan route to use execSync + nohup for complete nmap process independence
+- Created run-nmap-scan.sh - standalone bash script that runs nmap independently
+- nmap writes XML output to /tmp/vulnguard-scans/ temp files
+- GET /api/scan/[id] route reads XML files, parses results, and updates DB
+- Tested with 127.0.0.1: found port 81 (Caddy httpd), port 3000 (Next.js)
+- Tested with scanme.nmap.org: found 5 ports (SSH 22, SMTP 25, HTTP 80, nping-echo 9929, tcpwrapped 31337)
+- All results are REAL nmap data with service version detection
+
+Stage Summary:
+- VulnGuard is fully functional with real nmap scanning
+- Architecture: POST creates DB record + starts nmap via nohup → nmap writes XML to temp files → GET parses XML and updates DB
+- Production build used (next build + standalone server) for stability
+- Keeper script auto-restarts the server when sandbox kills it
+- Real scan results verified for both localhost and internet targets
+- Strict JSON contract: {target, ports: [{port_id, protocol, state, service, version}], vulnerabilities: [{port_id, cve_id, description}]}

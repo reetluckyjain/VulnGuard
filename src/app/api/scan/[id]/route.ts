@@ -1,14 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { getScanStatus } from "@/lib/scan-manager";
+import { processScanResults } from "../route";
 
 /**
  * GET /api/scan/[id] — Get scan status and results
  *
- * Reads scan status directly from the database.
- * The Python worker updates the DB with real nmap results.
- *
- * Status flow: Pending → Running → Completed | Failed
+ * Checks for nmap XML output files and processes them into results.
+ * The nmap process runs detached and writes to temp files.
+ * This route reads those files and updates the DB.
  */
 
 export async function GET(
@@ -18,46 +17,82 @@ export async function GET(
   try {
     const { id } = await params;
 
-    // Check live status from scan manager (reads DB)
-    const liveStatus = await getScanStatus(id);
-
-    if (liveStatus.status !== "Unknown") {
-      return NextResponse.json({
-        scan_id: id,
-        status: liveStatus.status,
-        results: liveStatus.results,
-        error: liveStatus.error,
-      });
-    }
-
-    // Final fallback: direct database query
+    // First check the DB for existing completed results
     const scan = await db.scan.findUnique({ where: { id } });
 
     if (!scan) {
       return NextResponse.json({ error: "Scan not found" }, { status: 404 });
     }
 
-    let parsedResults = null;
-    if (scan.results) {
-      try {
-        parsedResults = JSON.parse(scan.results);
-      } catch (parseError) {
-        console.error(
-          `[API] JSON.parse FAILED for scan ${id}:`,
-          parseError,
-          `\nRaw (first 200): ${scan.results.slice(0, 200)}`
-        );
+    // If already completed or failed, return from DB
+    if (scan.status === "Completed") {
+      let parsedResults = null;
+      if (scan.results) {
+        try { parsedResults = JSON.parse(scan.results); } catch {}
       }
+      return NextResponse.json({
+        scan_id: scan.id,
+        target: scan.target,
+        status: "Completed",
+        results: parsedResults,
+        created_at: scan.createdAt,
+        updated_at: scan.updatedAt,
+      });
     }
 
+    if (scan.status === "Failed") {
+      let error = "Scan failed";
+      if (scan.results) {
+        try {
+          const parsed = JSON.parse(scan.results);
+          if (parsed.error) error = parsed.error;
+        } catch {}
+      }
+      return NextResponse.json({
+        scan_id: scan.id,
+        target: scan.target,
+        status: "Failed",
+        error,
+        created_at: scan.createdAt,
+        updated_at: scan.updatedAt,
+      });
+    }
+
+    // Scan is still Running or Pending — check for nmap output files
+    const processed = await processScanResults(id);
+
+    if (processed.status === "Completed" && processed.results) {
+      return NextResponse.json({
+        scan_id: scan.id,
+        target: scan.target,
+        status: "Completed",
+        results: processed.results,
+        created_at: scan.createdAt,
+        updated_at: new Date(),
+      });
+    }
+
+    if (processed.status === "Failed") {
+      return NextResponse.json({
+        scan_id: scan.id,
+        target: scan.target,
+        status: "Failed",
+        error: processed.error || "Scan failed",
+        created_at: scan.createdAt,
+        updated_at: new Date(),
+      });
+    }
+
+    // Still running
     return NextResponse.json({
       scan_id: scan.id,
       target: scan.target,
-      status: scan.status,
-      results: parsedResults,
+      status: "Running",
+      results: null,
       created_at: scan.createdAt,
       updated_at: scan.updatedAt,
     });
+
   } catch (error) {
     console.error("[API] Error fetching scan:", error);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
