@@ -1,23 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
-import { spawn } from "child_process";
 
 /**
  * POST /api/scan — Create and execute a new scan
  *
  * This endpoint:
- * 1. Creates a scan record in the DB with "Running" status
- * 2. Spawns nmap directly as a child process (non-blocking, event-driven)
- * 3. When nmap completes, parses XML output and updates the DB
+ * 1. Validates the target and authorization
+ * 2. Creates a scan record in the DB with "Running" status
+ * 3. Sends the scan to the Python FastAPI backend (python-nmap engine)
  * 4. Returns immediately with scan_id for frontend polling
  *
- * NO MOCK DATA — Real nmap scans only.
- *
- * Scan strategy:
- * - Primary: nmap -sT -sV (service version detection, works without root)
- * - The vuln script scan (--script vuln) requires root/sudo, so it's
- *   attempted only if available, with graceful fallback
+ * NO MOCK DATA — Real nmap scans via python-nmap only.
  */
 
 // Authorization verification
@@ -36,7 +30,121 @@ function verifyAuthorization(target: string): { authorized: boolean; reason?: st
   return { authorized: true };
 }
 
-// ─── XML Parsing (inline, no external dependencies) ────────────────────────
+// ─── API Route Handler ─────────────────────────────────────────────────────
+
+const SCAN_ENGINE_PORT = 3001;
+const SCAN_ENGINE_TIMEOUT = 10000; // 10s timeout for initial request to Python backend
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { target, isAuthorized } = body;
+
+    if (!target || typeof target !== "string") {
+      return NextResponse.json({ error: "Target IP/hostname is required" }, { status: 400 });
+    }
+
+    const targetTrimmed = target.trim();
+    if (targetTrimmed.length < 3 || targetTrimmed.length > 253) {
+      return NextResponse.json({ error: "Invalid target format" }, { status: 400 });
+    }
+
+    if (!isAuthorized) {
+      return NextResponse.json({ error: "You must confirm authorization before scanning" }, { status: 403 });
+    }
+
+    const auth = verifyAuthorization(targetTrimmed);
+    if (!auth.authorized) {
+      return NextResponse.json({ error: auth.reason || "Target not authorized for scanning" }, { status: 403 });
+    }
+
+    const scanId = uuidv4();
+
+    // Create scan record with "Pending" status
+    await db.scan.create({
+      data: {
+        id: scanId,
+        target: targetTrimmed,
+        status: "Pending",
+      },
+    });
+
+    // Send scan request to Python FastAPI backend (python-nmap engine)
+    try {
+      const engineResponse = await fetch(
+        `http://localhost:${SCAN_ENGINE_PORT}/scan?XTransformPort=${SCAN_ENGINE_PORT}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scan_id: scanId, target: targetTrimmed }),
+          signal: AbortSignal.timeout(SCAN_ENGINE_TIMEOUT),
+        }
+      );
+
+      if (!engineResponse.ok) {
+        const errorData = await engineResponse.json().catch(() => ({}));
+        console.error("[API] Python scan engine error:", errorData);
+
+        // Update DB to Failed
+        await db.scan.update({
+          where: { id: scanId },
+          data: {
+            status: "Failed",
+            results: JSON.stringify({ error: `Scan engine error: ${(errorData as Record<string, unknown>).detail || "Unknown error"}` }),
+          },
+        });
+
+        return NextResponse.json({
+          scan_id: scanId,
+          target: targetTrimmed,
+          status: "Failed",
+          error: "Scan engine returned an error",
+        }, { status: 500 });
+      }
+
+      const engineData = await engineResponse.json();
+      console.log(`[API] Scan engine accepted: scan_id=${scanId}, status=${(engineData as Record<string, unknown>).status}`);
+    } catch (fetchErr) {
+      console.error("[API] Cannot reach Python scan engine:", fetchErr);
+
+      // Fallback: try to run nmap directly (for resilience)
+      console.log("[API] Attempting direct nmap fallback...");
+      try {
+        const { spawn } = await import("child_process");
+        await runNmapDirectly(scanId, targetTrimmed, spawn);
+      } catch (fallbackErr) {
+        console.error("[API] Direct nmap fallback also failed:", fallbackErr);
+        await db.scan.update({
+          where: { id: scanId },
+          data: {
+            status: "Failed",
+            results: JSON.stringify({ error: "Scan engine unavailable and direct nmap fallback failed" }),
+          },
+        });
+
+        return NextResponse.json({
+          scan_id: scanId,
+          target: targetTrimmed,
+          status: "Failed",
+          error: "Scan engine unavailable",
+        }, { status: 503 });
+      }
+    }
+
+    return NextResponse.json({
+      scan_id: scanId,
+      target: targetTrimmed,
+      status: "Running",
+      message: "Scan initiated via python-nmap engine. Poll GET /api/scan/[id] for results.",
+    }, { status: 201 });
+
+  } catch (error) {
+    console.error("[API] Error creating scan:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+
+// ─── Direct nmap Fallback ──────────────────────────────────────────────────
 
 const CVE_REGEX = /CVE-\d{4}-\d{4,7}/g;
 
@@ -137,120 +245,68 @@ function parseNmapXml(target: string, xml: string): ScanResult {
   return { target, ports, vulnerabilities };
 }
 
-// ─── Spawn nmap and handle results ─────────────────────────────────────────
+function runNmapDirectly(scanId: string, target: string, spawn: typeof import("child_process").spawn): Promise<void> {
+  return new Promise((resolve) => {
+    console.log(`[Fallback] Starting direct nmap scan for ${target}`);
 
-function spawnNmapScan(scanId: string, target: string) {
-  console.log(`[NmapSpawn] Starting nmap scan for ${target}`);
+    const nmapPath = "/home/z/.local/bin/nmap";
+    const args = ["-sT", "-sV", "-oX", "-", "--max-retries", "2", "--host-timeout", "30s", target];
 
-  const nmapPath = "/home/z/.local/bin/nmap";
-  // Use -sT -sV for service version detection (works without root)
-  // Also add --script vuln for CVE detection (may not find much without root)
-  const args = ["-sT", "-sV", "-oX", "-", "--max-retries", "2", "--host-timeout", "30s", target];
+    const proc = spawn(nmapPath, args, {
+      env: { ...process.env, PATH: `/home/z/.local/bin:${process.env.PATH}` },
+    });
 
-  const proc = spawn(nmapPath, args, {
-    env: { ...process.env, PATH: `/home/z/.local/bin:${process.env.PATH}` },
-  });
+    let xmlOutput = "";
 
-  let xmlOutput = "";
+    proc.stdout?.on("data", (data: Buffer) => {
+      xmlOutput += data.toString();
+    });
 
-  proc.stdout?.on("data", (data: Buffer) => {
-    xmlOutput += data.toString();
-  });
+    proc.stderr?.on("data", () => {
+      // Suppress noisy nmap stderr
+    });
 
-  proc.stderr?.on("data", (data: Buffer) => {
-    // Suppress noisy nmap stderr
-  });
+    proc.on("close", async (code) => {
+      console.log(`[Fallback] nmap exited with code ${code}, output length: ${xmlOutput.length}`);
 
-  proc.on("close", async (code) => {
-    console.log(`[NmapSpawn] nmap exited with code ${code}, output length: ${xmlOutput.length}`);
+      try {
+        if (xmlOutput && xmlOutput.includes("<nmaprun")) {
+          const result = parseNmapXml(target, xmlOutput);
+          const resultJson = JSON.stringify(result);
 
-    try {
-      if (xmlOutput && xmlOutput.includes("<nmaprun")) {
-        const result = parseNmapXml(target, xmlOutput);
-        const resultJson = JSON.stringify(result);
-
-        await db.scan.update({
-          where: { id: scanId },
-          data: { status: "Completed", results: resultJson },
-        });
-        console.log(`[NmapSpawn] Scan ${scanId} COMPLETED: ${result.ports.length} ports, ${result.vulnerabilities.length} vulns`);
-      } else {
-        await db.scan.update({
-          where: { id: scanId },
-          data: { status: "Failed", results: JSON.stringify({ error: "nmap produced no XML output" }) },
-        });
-        console.log(`[NmapSpawn] Scan ${scanId} FAILED: no XML output`);
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Completed", results: resultJson },
+          });
+          console.log(`[Fallback] Scan ${scanId} COMPLETED: ${result.ports.length} ports, ${result.vulnerabilities.length} vulns`);
+        } else {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Failed", results: JSON.stringify({ error: "nmap produced no XML output" }) },
+          });
+          console.log(`[Fallback] Scan ${scanId} FAILED: no XML output`);
+        }
+      } catch (err) {
+        console.error(`[Fallback] Error processing results for ${scanId}:`, err);
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Failed", results: JSON.stringify({ error: String(err) }) },
+          });
+        } catch {}
       }
-    } catch (err) {
-      console.error(`[NmapSpawn] Error processing results for ${scanId}:`, err);
+      resolve();
+    });
+
+    proc.on("error", async (err) => {
+      console.error(`[Fallback] Failed to spawn nmap:`, err);
       try {
         await db.scan.update({
           where: { id: scanId },
-          data: { status: "Failed", results: JSON.stringify({ error: String(err) }) },
+          data: { status: "Failed", results: JSON.stringify({ error: `Failed to run nmap: ${err.message}` }) },
         });
       } catch {}
-    }
-  });
-
-  proc.on("error", async (err) => {
-    console.error(`[NmapSpawn] Failed to spawn nmap:`, err);
-    try {
-      await db.scan.update({
-        where: { id: scanId },
-        data: { status: "Failed", results: JSON.stringify({ error: `Failed to run nmap: ${err.message}` }) },
-      });
-    } catch {}
-  });
-}
-
-// ─── API Route Handler ─────────────────────────────────────────────────────
-
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { target, isAuthorized } = body;
-
-    if (!target || typeof target !== "string") {
-      return NextResponse.json({ error: "Target IP/hostname is required" }, { status: 400 });
-    }
-
-    const targetTrimmed = target.trim();
-    if (targetTrimmed.length < 3 || targetTrimmed.length > 253) {
-      return NextResponse.json({ error: "Invalid target format" }, { status: 400 });
-    }
-
-    if (!isAuthorized) {
-      return NextResponse.json({ error: "You must confirm authorization before scanning" }, { status: 403 });
-    }
-
-    const auth = verifyAuthorization(targetTrimmed);
-    if (!auth.authorized) {
-      return NextResponse.json({ error: auth.reason || "Target not authorized for scanning" }, { status: 403 });
-    }
-
-    const scanId = uuidv4();
-
-    // Create scan record with "Running" status
-    await db.scan.create({
-      data: {
-        id: scanId,
-        target: targetTrimmed,
-        status: "Running",
-      },
+      resolve();
     });
-
-    // Spawn nmap as a child process (non-blocking, event-driven)
-    spawnNmapScan(scanId, targetTrimmed);
-
-    return NextResponse.json({
-      scan_id: scanId,
-      target: targetTrimmed,
-      status: "Running",
-      message: "Scan initiated. Real nmap scan is running. Poll GET /api/scan/[id] for results.",
-    }, { status: 201 });
-
-  } catch (error) {
-    console.error("[API] Error creating scan:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
-  }
+  });
 }

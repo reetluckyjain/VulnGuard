@@ -5,12 +5,12 @@ import { db } from "./db";
  * VulnGuard Scan Manager — Database Reader
  *
  * Architecture:
- *   1. Next.js POST /api/scan creates scan record + calls Bun scan service
- *   2. Bun scan service runs real nmap and updates the DB
+ *   1. Next.js POST /api/scan creates scan record + sends to Python FastAPI backend
+ *   2. Python backend runs real nmap via python-nmap and updates the DB
  *   3. This manager provides read access to scan status from the DB
  *   4. Frontend polls GET /api/scan/[id] for status updates
  *
- * NO MOCK DATA — All results come from real nmap scans.
+ * NO MOCK DATA — All results come from real nmap scans via python-nmap.
  */
 
 /**

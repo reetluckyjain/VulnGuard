@@ -350,7 +350,7 @@ export default function Home() {
             </div>
             <div>
               <h1 className="text-xl font-bold tracking-tight text-foreground">VulnGuard</h1>
-              <p className="text-xs text-muted-foreground">Ethical Vulnerability Scanner — Real Nmap Engine</p>
+              <p className="text-xs text-muted-foreground">Ethical Vulnerability Scanner — python-nmap Engine</p>
             </div>
             <Badge variant="outline" className="ml-auto text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
               <CheckCircle2 className="h-3 w-3 mr-1" />
@@ -457,7 +457,7 @@ export default function Home() {
               </div>
               <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
                 <Info className="h-3.5 w-3.5" />
-                <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — results are 100% real, no simulated data.</span>
+                <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">python-nmap</code> engine with <code className="bg-muted px-1 py-0.5 rounded">-sT -sV --script vuln</code> — results are 100% real.</span>
               </div>
             </CardContent>
           </Card>
@@ -487,7 +487,7 @@ export default function Home() {
                       {scanStatusText}
                     </p>
                     <p className="text-xs text-muted-foreground/60">
-                      Running <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — this may take 1-3 minutes for a real scan.
+                      Running <code className="bg-muted px-1 py-0.5 rounded">python-nmap -sT -sV --script vuln</code> — this may take 1-3 minutes for a real scan.
                     </p>
                   </div>
                 </CardContent>
@@ -728,7 +728,7 @@ export default function Home() {
                       </div>
                       <div className="sm:col-span-2">
                         <span className="text-muted-foreground">Scan Engine:</span>{' '}
-                        <span className="font-mono text-xs">nmap -sT -sV --script vuln (xml2js parser)</span>
+                        <span className="font-mono text-xs">python-nmap (-sT -sV --script vuln)</span>
                       </div>
                     </div>
                   </CardContent>
@@ -804,7 +804,7 @@ export default function Home() {
             <div className="mt-4 flex items-center justify-center gap-2 text-xs text-muted-foreground/40">
               <Badge variant="outline" className="text-xs">100% Real Data</Badge>
               <Badge variant="outline" className="text-xs">No Simulation</Badge>
-              <Badge variant="outline" className="text-xs">nmap + xml2js</Badge>
+              <Badge variant="outline" className="text-xs">python-nmap</Badge>
             </div>
           </motion.div>
         )}
@@ -816,7 +816,7 @@ export default function Home() {
           <div className="flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <Shield className="h-3.5 w-3.5 text-primary" />
-              VulnGuard &copy; 2025 — Real Nmap Engine
+              VulnGuard &copy; 2025 — python-nmap Engine
             </span>
             <span className="flex items-center gap-1.5">
               <ExternalLink className="h-3 w-3" />
