@@ -1,8 +1,7 @@
 {
   "name": "scan-engine",
   "version": "1.0.0",
-  "type": "module",
   "scripts": {
-    "dev": "bun index.ts"
+    "dev": "node index.js"
   }
 }

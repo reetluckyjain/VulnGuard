@@ -9,11 +9,10 @@ export async function GET(
   try {
     const { id } = await params;
 
-    // First check the in-memory scan manager for active scans
-    const liveStatus = getScanStatus(id);
+    // Check live status from scan engine + database
+    const liveStatus = await getScanStatus(id);
 
     if (liveStatus.status !== "Unknown") {
-      // Active scan - return live data
       return NextResponse.json({
         scan_id: id,
         status: liveStatus.status,
@@ -22,24 +21,23 @@ export async function GET(
       });
     }
 
-    // Fall back to database for completed/historical scans
-    const scan = await db.scan.findUnique({
-      where: { id },
-    });
+    // Final fallback: direct database query
+    const scan = await db.scan.findUnique({ where: { id } });
 
     if (!scan) {
-      return NextResponse.json(
-        { error: "Scan not found" },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: "Scan not found" }, { status: 404 });
     }
 
     let parsedResults = null;
     if (scan.results) {
       try {
         parsedResults = JSON.parse(scan.results);
-      } catch {
-        parsedResults = null;
+      } catch (parseError) {
+        console.error(
+          `[API] JSON.parse FAILED for scan ${id}:`,
+          parseError,
+          `\nRaw (first 200): ${scan.results.slice(0, 200)}`
+        );
       }
     }
 
@@ -51,12 +49,8 @@ export async function GET(
       created_at: scan.createdAt,
       updated_at: scan.updatedAt,
     });
-
   } catch (error) {
     console.error("[API] Error fetching scan:", error);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

@@ -1,24 +1,25 @@
-// Abstract base scanner interface - modular architecture for plugging in tools
+// ─── Strict JSON Data Contract ─────────────────────────────────────────────
+// This contract MUST match what real nmap parsing produces.
+// Every scanner plugin must conform to these exact shapes.
+
 export interface ScanResult {
   target: string;
-  scan_time: string;
   ports: PortInfo[];
   vulnerabilities: Vulnerability[];
 }
 
 export interface PortInfo {
-  port_number: number;
+  port_id: number;
   protocol: string;
   state: string;
-  service_name: string;
+  service: string;
   version: string;
 }
 
 export interface Vulnerability {
+  port_id: number;
   cve_id: string;
   description: string;
-  port: number;
-  severity: "Critical" | "High" | "Medium" | "Low";
 }
 
 export abstract class BaseScanner {

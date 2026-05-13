@@ -1,101 +1,137 @@
-import { NmapScanner } from "./scanners/nmap-scanner";
 import type { ScanResult } from "./scanners/base";
 import { db } from "./db";
 
-// In-memory task store for tracking active scans
-interface ScanTask {
-  id: string;
-  target: string;
-  status: "Pending" | "Running" | "Completed" | "Failed";
-  results: ScanResult | null;
-  error: string | null;
-  startedAt: Date;
-  completedAt: Date | null;
-}
+// ─── Scan Engine URL ────────────────────────────────────────────────────────
+// The scan engine runs as a separate Node.js process on port 3030.
+// Since both Next.js and the scan engine are Node.js processes,
+// they can communicate directly via localhost.
+const SCAN_ENGINE_URL = "http://127.0.0.1:3030";
 
-const scanTasks = new Map<string, ScanTask>();
-const scanner = new NmapScanner();
+// ─── In-memory cache for active scans ───────────────────────────────────────
+const scanCache = new Map<string, { status: string; results: ScanResult | null; error: string | null; fetchedAt: number }>();
+const CACHE_TTL = 5_000; // 5 seconds
 
 /**
- * Start an asynchronous scan task.
- * Returns immediately while the scan runs in the background.
+ * Start an asynchronous scan task by delegating to the scan engine mini-service.
+ * The scan engine runs nmap in a separate process, so it won't block Next.js.
  */
 export async function startScan(scanId: string, target: string): Promise<void> {
-  const task: ScanTask = {
-    id: scanId,
-    target,
-    status: "Running",
-    results: null,
-    error: null,
-    startedAt: new Date(),
-    completedAt: null,
-  };
-  scanTasks.set(scanId, task);
+  console.log(`[ScanManager] Triggering scan ${scanId} for target ${target} via scan engine`);
 
-  // Run scan asynchronously (fire-and-forget with DB updates)
-  scanner.runScan(target).then(async (results) => {
-    task.status = "Completed";
-    task.results = results;
-    task.completedAt = new Date();
+  try {
+    const response = await fetch(`${SCAN_ENGINE_URL}/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, scan_id: scanId }),
+      signal: AbortSignal.timeout(5000),
+    });
 
-    // Update database
-    try {
-      await db.scan.update({
-        where: { id: scanId },
-        data: {
-          status: "Completed",
-          results: JSON.stringify(results),
-        },
-      });
-    } catch (err) {
-      console.error("[ScanManager] Failed to update DB:", err);
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as { error?: string };
+      throw new Error(`Scan engine returned ${response.status}: ${errorData.error || "Unknown"}`);
     }
 
-    console.log(`[ScanManager] Scan ${scanId} completed for ${target}`);
-  }).catch(async (err) => {
-    task.status = "Failed";
-    task.error = err.message || "Unknown error";
-    task.completedAt = new Date();
+    console.log(`[ScanManager] Scan ${scanId} triggered successfully via engine`);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[ScanManager] Failed to trigger scan ${scanId}:`, errorMessage);
 
-    // Update database
+    // Mark as failed in DB
     try {
       await db.scan.update({
         where: { id: scanId },
         data: {
           status: "Failed",
+          results: JSON.stringify({ error: `Scan engine unavailable: ${errorMessage}` }),
         },
       });
     } catch (dbErr) {
-      console.error("[ScanManager] Failed to update DB:", dbErr);
+      console.error(`[ScanManager] DB update failed for ${scanId}:`, dbErr);
     }
-
-    console.error(`[ScanManager] Scan ${scanId} failed:`, err);
-  });
+    throw err;
+  }
 }
 
 /**
  * Get the current status of a scan task.
- * Checks in-memory store first, then falls back to database.
+ * Polls the scan engine mini-service, with database fallback.
  */
-export function getScanStatus(scanId: string): {
+export async function getScanStatus(scanId: string): Promise<{
   status: string;
   results: ScanResult | null;
   error: string | null;
-} {
-  const task = scanTasks.get(scanId);
-
-  if (task) {
-    return {
-      status: task.status,
-      results: task.results,
-      error: task.error,
-    };
+}> {
+  // Check cache first
+  const cached = scanCache.get(scanId);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
+    return { status: cached.status, results: cached.results, error: cached.error };
   }
 
-  // Not in memory - might be a stale/old scan
-  return {
-    status: "Unknown",
-    results: null,
-    error: null,
-  };
+  // Poll the scan engine for live status
+  try {
+    const response = await fetch(`${SCAN_ENGINE_URL}/scan/${scanId}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+
+    if (response.ok) {
+      const data = await response.json() as {
+        status: string;
+        results: ScanResult | null;
+        error: string | null;
+      };
+
+      // If completed, update the database
+      if (data.status === "Completed" && data.results) {
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Completed", results: JSON.stringify(data.results) },
+          });
+        } catch (dbErr) {
+          console.error(`[ScanManager] DB update failed for completed scan ${scanId}:`, dbErr);
+        }
+      } else if (data.status === "Failed") {
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Failed", results: JSON.stringify({ error: data.error }) },
+          });
+        } catch (dbErr) {
+          console.error(`[ScanManager] DB update failed for failed scan ${scanId}:`, dbErr);
+        }
+      }
+
+      // Update cache
+      scanCache.set(scanId, {
+        status: data.status,
+        results: data.results,
+        error: data.error,
+        fetchedAt: Date.now(),
+      });
+
+      return { status: data.status, results: data.results, error: data.error };
+    }
+  } catch {
+    // Scan engine unreachable — fall back to database
+  }
+
+  // Database fallback
+  try {
+    const scan = await db.scan.findUnique({ where: { id: scanId } });
+    if (scan) {
+      let parsedResults: ScanResult | null = null;
+      if (scan.results) {
+        try {
+          parsedResults = JSON.parse(scan.results);
+        } catch (parseErr) {
+          console.error(`[ScanManager] JSON.parse failed for scan ${scanId}:`, parseErr);
+        }
+      }
+      return { status: scan.status, results: parsedResults, error: null };
+    }
+  } catch (dbErr) {
+    console.error(`[ScanManager] DB lookup failed for scan ${scanId}:`, dbErr);
+  }
+
+  return { status: "Unknown", results: null, error: null };
 }
