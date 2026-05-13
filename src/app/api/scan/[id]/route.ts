@@ -2,6 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getScanStatus } from "@/lib/scan-manager";
 
+/**
+ * GET /api/scan/[id] — Get scan status and results
+ *
+ * Reads scan status directly from the database.
+ * The Python worker updates the DB with real nmap results.
+ *
+ * Status flow: Pending → Running → Completed | Failed
+ */
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -9,7 +18,7 @@ export async function GET(
   try {
     const { id } = await params;
 
-    // Check live status from scan engine + database
+    // Check live status from scan manager (reads DB)
     const liveStatus = await getScanStatus(id);
 
     if (liveStatus.status !== "Unknown") {

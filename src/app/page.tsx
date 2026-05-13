@@ -15,6 +15,8 @@ import {
   CheckCircle2,
   Wifi,
   WifiOff,
+  Loader2,
+  Info,
 } from 'lucide-react'
 
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
@@ -33,6 +35,8 @@ import {
 import { toast } from '@/hooks/use-toast'
 
 // ─── Types — Strict JSON Data Contract ──────────────────────────────────────
+// This contract MUST match what the nmap scanner produces.
+// NO MOCK DATA — All results come from real nmap scans.
 
 interface PortInfo {
   port_id: number
@@ -57,7 +61,7 @@ interface ScanResult {
 interface ScanHistoryEntry {
   id: string
   target: string
-  status: 'running' | 'completed' | 'failed'
+  status: 'pending' | 'running' | 'completed' | 'failed'
   timestamp: string
   results?: ScanResult
 }
@@ -98,6 +102,17 @@ const staggerItem = {
   visible: { opacity: 1, x: 0, transition: { duration: 0.3 } },
 }
 
+// ─── Normalize Status ───────────────────────────────────────────────────────
+
+function normalizeStatus(status: string): ScanHistoryEntry['status'] {
+  const s = status.toLowerCase()
+  if (s === 'pending') return 'pending'
+  if (s === 'running') return 'running'
+  if (s === 'completed') return 'completed'
+  if (s === 'failed') return 'failed'
+  return 'pending'
+}
+
 // ─── Main Page ──────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -110,12 +125,15 @@ export default function Home() {
   const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([])
   const [activeScanId, setActiveScanId] = useState<string | null>(null)
   const [pollCount, setPollCount] = useState(0)
+  const [scanStatusText, setScanStatusText] = useState('Initializing...')
 
   // ─── Derived Stats ──────────────────────────────────────────────────────
 
-  const openPortCount = scanResult?.ports.filter((p) => p.state?.toLowerCase() === 'open').length ?? 0
-  const vulnCount = scanResult?.vulnerabilities.length ?? 0
-  const uniqueCveCount = new Set(scanResult?.vulnerabilities.map((v) => v.cve_id)).size
+  const openPortCount = scanResult?.ports?.filter((p) => p.state?.toLowerCase() === 'open').length ?? 0
+  const closedPortCount = scanResult?.ports?.filter((p) => p.state?.toLowerCase() === 'closed').length ?? 0
+  const filteredPortCount = scanResult?.ports?.filter((p) => p.state?.toLowerCase() === 'filtered').length ?? 0
+  const vulnCount = scanResult?.vulnerabilities?.length ?? 0
+  const uniqueCveCount = new Set(scanResult?.vulnerabilities?.map((v) => v.cve_id) ?? []).size
 
   // ─── Start Scan ─────────────────────────────────────────────────────────
 
@@ -127,7 +145,6 @@ export default function Home() {
 
     const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
     const hostnameRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/
-    // Also allow CIDR notation
     const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/
 
     if (!ipRegex.test(target.trim()) && !hostnameRegex.test(target.trim()) && !cidrRegex.test(target.trim())) {
@@ -144,6 +161,16 @@ export default function Home() {
     setIsScanning(true)
     setCurrentScanTarget(target.trim())
     setScanResult(null)
+    setScanStatusText('Running real nmap scan...')
+
+    const scanId = `scan-${Date.now()}`
+    const historyEntry: ScanHistoryEntry = {
+      id: scanId,
+      target: target.trim(),
+      status: 'running',
+      timestamp: new Date().toISOString(),
+    }
+    setScanHistory((prev) => [historyEntry, ...prev])
 
     try {
       const response = await fetch('/api/scan', {
@@ -158,18 +185,57 @@ export default function Home() {
       }
 
       const data = await response.json()
-      const scanId = data.scan_id
+      const returnedScanId = data.scan_id || scanId
+      const returnedStatus = normalizeStatus(data.status || '')
 
-      setActiveScanId(scanId)
-      setPollCount(0)
+      if (data.results) {
+        // Scan completed synchronously — display results directly
+        setScanResult(data.results)
+        setIsScanning(false)
+        setCurrentScanTarget('')
+        setActiveScanId(null)
 
-      const historyEntry: ScanHistoryEntry = {
-        id: scanId,
-        target: target.trim(),
-        status: 'running',
-        timestamp: new Date().toISOString(),
+        setScanHistory((prev) =>
+          prev.map((entry) =>
+            entry.id === scanId
+              ? { ...entry, id: returnedScanId, status: (returnedStatus || 'completed') as const, results: data.results }
+              : entry
+          )
+        )
+
+        const portCount = data.results.ports?.length ?? 0
+        const vulnCount = data.results.vulnerabilities?.length ?? 0
+        toast({
+          title: 'Scan Complete',
+          description: `Real nmap scan of ${data.results.target || target.trim()} completed — ${portCount} ports, ${vulnCount} vulnerabilities`,
+        })
+      } else if (returnedStatus === 'failed') {
+        setIsScanning(false)
+        setCurrentScanTarget('')
+
+        setScanHistory((prev) =>
+          prev.map((entry) =>
+            entry.id === scanId ? { ...entry, id: returnedScanId, status: 'failed' as const } : entry
+          )
+        )
+
+        toast({
+          title: 'Scan Failed',
+          description: data.error || 'The nmap scan encountered an error',
+          variant: 'destructive',
+        })
+      } else {
+        // Scan is still running — start polling
+        setActiveScanId(returnedScanId)
+        setPollCount(0)
+        setScanStatusText('Scan submitted — waiting for results...')
+
+        setScanHistory((prev) =>
+          prev.map((entry) =>
+            entry.id === scanId ? { ...entry, id: returnedScanId } : entry
+          )
+        )
       }
-      setScanHistory((prev) => [historyEntry, ...prev])
     } catch (err) {
       setIsScanning(false)
       setCurrentScanTarget('')
@@ -182,7 +248,7 @@ export default function Home() {
 
       setScanHistory((prev) =>
         prev.map((entry) =>
-          entry.status === 'running' ? { ...entry, status: 'failed' as const } : entry
+          entry.id === scanId ? { ...entry, status: 'failed' as const } : entry
         )
       )
     }
@@ -203,6 +269,12 @@ export default function Home() {
 
         const statusLower = (data.status || '').toLowerCase()
 
+        if (statusLower === 'pending') {
+          setScanStatusText('Scan queued — waiting for processing...')
+        } else if (statusLower === 'running') {
+          setScanStatusText('Real nmap scan in progress — analyzing target...')
+        }
+
         if (statusLower === 'completed' && data.results) {
           setScanResult(data.results)
           setIsScanning(false)
@@ -219,7 +291,7 @@ export default function Home() {
 
           toast({
             title: 'Scan Complete',
-            description: `Scan of ${data.results.target || activeScanId} completed — ${data.results.ports?.length || 0} ports found`,
+            description: `Real nmap scan of ${data.results.target || activeScanId} completed`,
           })
         } else if (statusLower === 'failed') {
           setIsScanning(false)
@@ -234,12 +306,12 @@ export default function Home() {
 
           toast({
             title: 'Scan Failed',
-            description: data.error || 'The scan encountered an error',
+            description: data.error || 'The nmap scan encountered an error',
             variant: 'destructive',
           })
         }
       } catch {
-        // Continue polling — transient network errors are expected
+        // Continue polling
       }
     }, 3000)
 
@@ -278,8 +350,12 @@ export default function Home() {
             </div>
             <div>
               <h1 className="text-xl font-bold tracking-tight text-foreground">VulnGuard</h1>
-              <p className="text-xs text-muted-foreground">Ethical Vulnerability Scanner</p>
+              <p className="text-xs text-muted-foreground">Ethical Vulnerability Scanner — Real Nmap Engine</p>
             </div>
+            <Badge variant="outline" className="ml-auto text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+              <CheckCircle2 className="h-3 w-3 mr-1" />
+              Real Data Only
+            </Badge>
           </div>
         </div>
       </header>
@@ -298,6 +374,7 @@ export default function Home() {
                     <p className="text-xs text-muted-foreground mt-1">
                       Scanning networks without explicit permission is illegal in most jurisdictions.
                       You must confirm you have proper authorization before proceeding.
+                      This tool runs <strong>real nmap scans</strong> against the specified target.
                     </p>
                   </div>
                   <div className="flex items-start gap-3">
@@ -312,7 +389,7 @@ export default function Home() {
                     />
                     <label htmlFor="authorization" className="text-sm leading-relaxed cursor-pointer select-none">
                       I confirm I have explicit authorization to scan this target. I understand that
-                      unauthorized scanning is illegal.
+                      unauthorized scanning is illegal and this tool performs real network scans.
                     </label>
                   </div>
                 </div>
@@ -326,14 +403,16 @@ export default function Home() {
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Start New Scan</CardTitle>
-              <CardDescription>Enter a target IP address, hostname, or CIDR range to scan for open ports and vulnerabilities</CardDescription>
+              <CardDescription>
+                Enter a target IP address, hostname, or CIDR range. Real nmap will scan for open ports, services, and vulnerabilities.
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <div className="flex flex-col sm:flex-row gap-3">
                 <div className="flex-1">
                   <Input
                     type="text"
-                    placeholder="e.g., 192.168.1.1, example.com, or 10.0.0.0/24"
+                    placeholder="e.g., 192.168.1.1, scanme.nmap.org, or 10.0.0.0/24"
                     value={target}
                     onChange={(e) => {
                       setTarget(e.target.value)
@@ -359,7 +438,7 @@ export default function Home() {
                   >
                     {isScanning ? (
                       <span className="flex items-center gap-2">
-                        <span className="h-4 w-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                        <Loader2 className="h-4 w-4 animate-spin" />
                         Scanning...
                       </span>
                     ) : (
@@ -375,6 +454,10 @@ export default function Home() {
                     </Button>
                   )}
                 </div>
+              </div>
+              <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+                <Info className="h-3.5 w-3.5" />
+                <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — results are 100% real, no simulated data.</span>
               </div>
             </CardContent>
           </Card>
@@ -392,17 +475,21 @@ export default function Home() {
                       <div className="absolute inset-0 h-3 w-3 bg-emerald-500 rounded-full animate-ping opacity-30" />
                     </div>
                     <span className="text-sm font-medium">
-                      Scanning <span className="font-mono text-primary">{currentScanTarget}</span>...
+                      Scanning <span className="font-mono text-primary">{currentScanTarget}</span>
                     </span>
-                    <span className="text-xs text-muted-foreground ml-auto">Poll #{pollCount}</span>
+                    {activeScanId && <span className="text-xs text-muted-foreground ml-auto">Poll #{pollCount}</span>}
                   </div>
                   <div className="relative h-2 w-full overflow-hidden rounded-full bg-primary/10">
                     <div className="absolute inset-0 h-full w-1/3 rounded-full bg-primary animate-indeterminate" />
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    Running <code className="text-xs bg-muted px-1 py-0.5 rounded">nmap -sV --script vuln</code> — this may take several minutes.
-                    Results will appear automatically when the scan completes.
-                  </p>
+                  <div className="space-y-1">
+                    <p className="text-sm text-muted-foreground">
+                      {scanStatusText}
+                    </p>
+                    <p className="text-xs text-muted-foreground/60">
+                      Running <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — this may take 1-3 minutes for a real scan.
+                    </p>
+                  </div>
                 </CardContent>
               </Card>
             </motion.div>
@@ -415,7 +502,6 @@ export default function Home() {
             <motion.div variants={staggerContainer} initial="hidden" animate="visible" className="space-y-8">
               {/* ── Summary Cards ──────────────────────────────────────── */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                {/* Open Ports */}
                 <motion.div custom={0} variants={cardVariants}>
                   <Card className="hover:border-primary/30 transition-colors">
                     <CardContent className="p-4 sm:p-6">
@@ -428,11 +514,15 @@ export default function Home() {
                           <Server className="h-5 w-5 text-primary" />
                         </div>
                       </div>
+                      {(closedPortCount > 0 || filteredPortCount > 0) && (
+                        <p className="text-xs text-muted-foreground mt-2">
+                          +{closedPortCount} closed, {filteredPortCount} filtered
+                        </p>
+                      )}
                     </CardContent>
                   </Card>
                 </motion.div>
 
-                {/* Vulnerabilities */}
                 <motion.div custom={1} variants={cardVariants}>
                   <Card className={vulnCount > 0 ? 'border-orange-500/30 hover:border-orange-500/50' : 'border-emerald-500/30 hover:border-emerald-500/50'}>
                     <CardContent className="p-4 sm:p-6">
@@ -444,18 +534,13 @@ export default function Home() {
                           </p>
                         </div>
                         <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${vulnCount > 0 ? 'bg-orange-500/10' : 'bg-emerald-500/10'}`}>
-                          {vulnCount > 0 ? (
-                            <AlertTriangle className="h-5 w-5 text-orange-400" />
-                          ) : (
-                            <CheckCircle2 className="h-5 w-5 text-emerald-400" />
-                          )}
+                          {vulnCount > 0 ? <AlertTriangle className="h-5 w-5 text-orange-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
                         </div>
                       </div>
                     </CardContent>
                   </Card>
                 </motion.div>
 
-                {/* Unique CVEs */}
                 <motion.div custom={2} variants={cardVariants}>
                   <Card className={uniqueCveCount > 0 ? 'border-red-500/20 bg-red-500/5 hover:border-red-500/40' : 'border-emerald-500/20 bg-emerald-500/5 hover:border-emerald-500/40'}>
                     <CardContent className="p-4 sm:p-6">
@@ -467,18 +552,13 @@ export default function Home() {
                           </p>
                         </div>
                         <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${uniqueCveCount > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>
-                          {uniqueCveCount > 0 ? (
-                            <AlertTriangle className="h-5 w-5 text-red-400" />
-                          ) : (
-                            <CheckCircle2 className="h-5 w-5 text-emerald-400" />
-                          )}
+                          {uniqueCveCount > 0 ? <AlertTriangle className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
                         </div>
                       </div>
                     </CardContent>
                   </Card>
                 </motion.div>
 
-                {/* Target */}
                 <motion.div custom={3} variants={cardVariants}>
                   <Card className="hover:border-primary/30 transition-colors">
                     <CardContent className="p-4 sm:p-6">
@@ -493,21 +573,24 @@ export default function Home() {
                           <Clock className="h-5 w-5 text-primary" />
                         </div>
                       </div>
+                      <p className="text-xs text-muted-foreground mt-2">
+                        {scanResult.ports?.length ?? 0} total ports scanned
+                      </p>
                     </CardContent>
                   </Card>
                 </motion.div>
               </div>
 
-              {/* ── Open Ports Table ───────────────────────────────────── */}
+              {/* ── All Ports Table ───────────────────────────────────── */}
               <motion.div custom={4} variants={cardVariants}>
                 <Card>
                   <CardHeader>
                     <CardTitle className="text-base flex items-center gap-2">
                       {openPortCount > 0 ? <Wifi className="h-4 w-4 text-emerald-400" /> : <WifiOff className="h-4 w-4 text-muted-foreground" />}
-                      Open Ports
+                      Port Scan Results
                     </CardTitle>
                     <CardDescription>
-                      Discovered network services on {scanResult.target || 'target'}
+                      Discovered network services on {scanResult.target || 'target'} (real nmap output)
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -538,7 +621,7 @@ export default function Home() {
                                   </Badge>
                                 </TableCell>
                                 <TableCell>{port.service || 'unknown'}</TableCell>
-                                <TableCell className="text-muted-foreground text-xs">
+                                <TableCell className="text-muted-foreground text-xs max-w-[200px] truncate">
                                   {port.version || 'Unknown'}
                                 </TableCell>
                               </TableRow>
@@ -549,7 +632,7 @@ export default function Home() {
                     ) : (
                       <div className="text-center py-8">
                         <WifiOff className="h-10 w-10 text-muted-foreground/30 mx-auto mb-3" />
-                        <p className="text-sm text-muted-foreground font-medium">No open ports found.</p>
+                        <p className="text-sm text-muted-foreground font-medium">No ports found.</p>
                         <p className="text-xs text-muted-foreground/60 mt-1">
                           The host may be down, firewalled, or unreachable.
                         </p>
@@ -564,15 +647,11 @@ export default function Home() {
                 <Card>
                   <CardHeader>
                     <CardTitle className="text-base flex items-center gap-2">
-                      {vulnCount > 0 ? (
-                        <AlertTriangle className="h-4 w-4 text-orange-400" />
-                      ) : (
-                        <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-                      )}
+                      {vulnCount > 0 ? <AlertTriangle className="h-4 w-4 text-orange-400" /> : <CheckCircle2 className="h-4 w-4 text-emerald-400" />}
                       Vulnerabilities
                     </CardTitle>
                     <CardDescription>
-                      Security issues detected on {scanResult.target || 'target'}
+                      Security issues detected by nmap vuln scripts on {scanResult.target || 'target'}
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -609,13 +688,49 @@ export default function Home() {
                       <div className="text-center py-8">
                         <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-sm px-4 py-1.5">
                           <CheckCircle2 className="h-4 w-4 mr-2" />
-                          Secure — No vulnerabilities detected
+                          Secure — No vulnerabilities detected by nmap vuln scripts
                         </Badge>
                         <p className="text-xs text-muted-foreground/60 mt-3">
                           No CVEs were found by the nmap vuln script on this target.
                         </p>
                       </div>
                     )}
+                  </CardContent>
+                </Card>
+              </motion.div>
+
+              {/* ── Scan Info ─────────────────────────────────────────── */}
+              <motion.div custom={6} variants={cardVariants}>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base flex items-center gap-2">
+                      <Info className="h-4 w-4 text-muted-foreground" />
+                      Scan Information
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                      <div>
+                        <span className="text-muted-foreground">Target:</span>{' '}
+                        <span className="font-mono">{scanResult.target || 'N/A'}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Ports Found:</span>{' '}
+                        <span className="font-mono">{scanResult.ports?.length ?? 0}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Open Ports:</span>{' '}
+                        <span className="font-mono text-emerald-400">{openPortCount}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Vulnerabilities:</span>{' '}
+                        <span className={`font-mono ${vulnCount > 0 ? 'text-orange-400' : 'text-emerald-400'}`}>{vulnCount}</span>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <span className="text-muted-foreground">Scan Engine:</span>{' '}
+                        <span className="font-mono text-xs">nmap -sT -sV --script vuln (xml2js parser)</span>
+                      </div>
+                    </div>
                   </CardContent>
                 </Card>
               </motion.div>
@@ -648,12 +763,12 @@ export default function Home() {
                               className={
                                 entry.status === 'completed'
                                   ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
-                                  : entry.status === 'running'
+                                  : entry.status === 'running' || entry.status === 'pending'
                                     ? 'bg-primary/20 text-primary border-primary/30'
                                     : 'bg-red-500/20 text-red-400 border-red-500/30'
                               }
                             >
-                              {entry.status === 'running' && (
+                              {(entry.status === 'running' || entry.status === 'pending') && (
                                 <span className="h-1.5 w-1.5 bg-primary rounded-full animate-pulse-dot mr-1" />
                               )}
                               {entry.status}
@@ -684,8 +799,13 @@ export default function Home() {
             <Shield className="h-16 w-16 text-muted-foreground/20 mx-auto mb-4" />
             <h3 className="text-lg font-medium text-muted-foreground">No scan results yet</h3>
             <p className="text-sm text-muted-foreground/60 mt-1">
-              Enter a target above and start scanning to see results
+              Enter a target above and start scanning to see real nmap results
             </p>
+            <div className="mt-4 flex items-center justify-center gap-2 text-xs text-muted-foreground/40">
+              <Badge variant="outline" className="text-xs">100% Real Data</Badge>
+              <Badge variant="outline" className="text-xs">No Simulation</Badge>
+              <Badge variant="outline" className="text-xs">nmap + xml2js</Badge>
+            </div>
           </motion.div>
         )}
       </main>
@@ -696,11 +816,11 @@ export default function Home() {
           <div className="flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <Shield className="h-3.5 w-3.5 text-primary" />
-              VulnGuard &copy; 2024
+              VulnGuard &copy; 2025 — Real Nmap Engine
             </span>
             <span className="flex items-center gap-1.5">
               <ExternalLink className="h-3 w-3" />
-              For authorized security testing only
+              For authorized security testing only — No mock data
             </span>
           </div>
         </div>

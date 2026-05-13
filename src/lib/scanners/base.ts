@@ -1,5 +1,5 @@
 // ─── Strict JSON Data Contract ─────────────────────────────────────────────
-// This contract MUST match what real nmap parsing produces.
+// This contract MUST match what the Python scan engine produces.
 // Every scanner plugin must conform to these exact shapes.
 
 export interface ScanResult {

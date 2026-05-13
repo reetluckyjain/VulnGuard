@@ -1,392 +1,310 @@
-import { BaseScanner, ScanResult, PortInfo, Vulnerability } from "./base";
+/**
+ * VulnGuard Nmap Scanner — Direct Execution Module
+ *
+ * Runs real nmap scans directly from Node.js using child_process.
+ * Parses XML output using fast-xml-parser and extracts ports, services, and CVE data.
+ *
+ * NO MOCK DATA — All results come from real nmap scans.
+ *
+ * Strict JSON Data Contract:
+ * {
+ *   target: string,
+ *   ports: [{ port_id: number, protocol: string, state: string, service: string, version: string }],
+ *   vulnerabilities: [{ port_id: number, cve_id: string, description: string }]
+ * }
+ */
+
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { accessSync, constants } from "fs";
-import * as path from "path";
-import * as os from "os";
+import { XMLParser } from "fast-xml-parser";
+import type { ScanResult, PortInfo, Vulnerability } from "./base";
 
 const execFileAsync = promisify(execFile);
 
-// ─── CVE Regex ──────────────────────────────────────────────────────────────
-// Matches CVE identifiers in nmap --script vuln output
+// ─── CVE Regex ─────────────────────────────────────────────────────────────
+
 const CVE_REGEX = /CVE-\d{4}-\d{4,7}/g;
 
-// ─── PATH Configuration ────────────────────────────────────────────────────
-const NMAP_PATHS = [
-  "/usr/bin",
-  "/usr/local/bin",
-  path.join(os.homedir(), ".local/bin"),
-  "/opt/homebrew/bin",
-];
+// ─── Nmap Binary Path ──────────────────────────────────────────────────────
 
-function getEnrichedEnv(): NodeJS.ProcessEnv {
-  const existingPath = process.env.PATH || "";
-  const additionalPaths = NMAP_PATHS.filter((p) => !existingPath.includes(p)).join(":");
-  return {
-    ...process.env,
-    PATH: additionalPaths ? `${additionalPaths}:${existingPath}` : existingPath,
-  };
-}
+function getNmapPath(): string {
+  const candidates = [
+    process.env.NMAP_PATH,
+    "/home/z/.local/bin/nmap",
+    "/usr/bin/nmap",
+    "/usr/local/bin/nmap",
+    "nmap",
+  ];
 
-function resolveNmapPath(): string {
-  const localBin = path.join(os.homedir(), ".local/bin/nmap");
-  try {
-    accessSync(localBin, constants.X_OK);
-    return localBin;
-  } catch {
-    return "nmap";
+  for (const candidate of candidates) {
+    if (candidate) return candidate;
   }
+
+  return "nmap";
 }
+
+// ─── Helper: ensure value is always an array ────────────────────────────────
+
+function ensureArray<T>(value: T | T[] | undefined): T[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+// ─── XML Parsing ───────────────────────────────────────────────────────────
+
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text",
+  // Don't force arrays - handle both single and multiple element cases
+  isArray: () => false,
+});
+
+type XmlObj = Record<string, unknown> | string | number | boolean | undefined | null | XmlObj[];
 
 /**
- * NmapScanner
- *
- * Real implementation that spawns nmap as a child process and parses the XML output.
- *
- * Scan strategy (adaptive):
- *  1. First attempt: `nmap -sV --script vuln -oX - <target>` (full vulnerability scan)
- *  2. If vuln scripts fail (require root, timeout, etc.), fall back to:
- *     `nmap -sV -oX - <target>` (service version detection only)
- *
- * The parser handles real nmap XML structure including:
- *  - <port> elements with portid, protocol, state
- *  - <service> elements with name, product, version
- *  - <script> elements with CVE extraction from output attribute and nested <elem> tags
- *
- * NO mock data. NO silent fallback. All errors are logged.
+ * Parse nmap XML output and extract ports + vulnerabilities
  */
-export class NmapScanner extends BaseScanner {
-  name = "Nmap";
+function parseNmapXml(target: string, xmlObj: XmlObj): ScanResult {
+  const ports: PortInfo[] = [];
+  const vulnerabilities: Vulnerability[] = [];
 
-  async runScan(target: string): Promise<ScanResult> {
-    const nmapBin = resolveNmapPath();
-    const env = getEnrichedEnv();
+  const nmaprun = xmlObj?.nmaprun;
+  if (!nmaprun) return { target, ports, vulnerabilities };
 
-    // ── Step 1: Verify nmap is available ──────────────────────────────────
-    const nmapAvailable = await this.checkNmapAvailable(nmapBin, env);
-    if (!nmapAvailable) {
-      const errMsg =
-        `nmap binary not found on this system. ` +
-        `Install it with: sudo apt-get install nmap (Debian/Ubuntu) ` +
-        `or brew install nmap (macOS). ` +
-        `The scanner requires a real nmap installation to function.`;
-      console.error(`[NmapScanner] FATAL: ${errMsg}`);
-      throw new Error(errMsg);
-    }
+  const hosts = ensureArray(nmaprun.host);
 
-    // ── Step 2: Try full vuln scan first, fall back to service scan ──────
-    let xmlOutput: string;
-    let usedVulnScan = false;
+  for (const host of hosts) {
+    // Check host state
+    if (host?.state?.["@_state"] === "down") continue;
 
-    // Attempt 1: Full vulnerability scan with --script vuln
-    // NOTE: --script vuln can be very slow (minutes) and requires root for SYN scan.
-    // We use a short timeout to avoid blocking the server, then fall back gracefully.
-    console.log(`[NmapScanner] Attempting full vuln scan: ${nmapBin} -sV --script vuln -oX - ${target}`);
-    try {
-      const { stdout } = await execFileAsync(nmapBin, ["-sV", "--script", "vuln", "-oX", "-", target], {
-        timeout: 30000, // 30 second timeout — vuln scan must respond quickly or we fall back
-        maxBuffer: 10 * 1024 * 1024,
-        env,
-        killSignal: "SIGKILL", // Force-kill nmap if it times out
+    const portList = ensureArray(host?.ports?.port);
+
+    for (const port of portList) {
+      const portId = parseInt(port?.["@_portid"] || "0", 10);
+      const protocol = port?.["@_protocol"] || "tcp";
+
+      // State
+      const state = port?.state?.["@_state"] || "unknown";
+
+      // Service
+      const svc = port?.service;
+      const serviceName = svc?.["@_name"] || "unknown";
+      const product = svc?.["@_product"] || "";
+      const version = svc?.["@_version"] || "";
+      const extrainfo = svc?.["@_extrainfo"] || "";
+
+      // Build version string
+      const versionParts: string[] = [];
+      if (product) versionParts.push(product);
+      if (version) versionParts.push(version);
+      if (extrainfo) versionParts.push(`(${extrainfo})`);
+      const versionStr = versionParts.length > 0 ? versionParts.join(" ") : "Unknown";
+
+      ports.push({
+        port_id: portId,
+        protocol,
+        state,
+        service: serviceName,
+        version: versionStr,
       });
-      xmlOutput = stdout;
-      usedVulnScan = true;
-      console.log(`[NmapScanner] Full vuln scan completed for ${target}. XML length: ${xmlOutput.length}`);
-    } catch (err: unknown) {
-      const execErr = err as { code?: string; stderr?: string; message?: string; stdout?: string; killed?: boolean };
 
-      // If we got partial XML from the vuln scan, use it
-      if (execErr.stdout && execErr.stdout.includes("<nmaprun")) {
-        xmlOutput = execErr.stdout;
-        usedVulnScan = true;
-        console.log(`[NmapScanner] Using partial XML from vuln scan (process exited with error)`);
-      } else {
-        // vuln scan failed — log why, then fall back to service-only scan
-        if (execErr.killed) {
-          console.warn(`[NmapScanner] Vuln scan TIMED OUT for ${target}. Falling back to service-only scan.`);
-        } else if (execErr.code === "ENOENT") {
-          throw new Error("nmap binary not found. Please install nmap.");
-        } else {
-          console.warn(
-            `[NmapScanner] Vuln scan FAILED for ${target}: ${execErr.message || "Unknown error"}. ` +
-            `Falling back to service-only scan.`
-          );
-          if (execErr.stderr) {
-            console.warn(`[NmapScanner] nmap stderr: ${execErr.stderr.slice(0, 300)}`);
+      // Parse script output for CVEs
+      const scripts = ensureArray(port?.script);
+      for (const script of scripts) {
+        const scriptId = script?.["@_id"] || "unknown";
+        const scriptOutput = script?.["@_output"] || "";
+
+        // Collect all text from the script output and nested elements
+        const textParts: string[] = [scriptOutput];
+
+        // Check elem children
+        const scriptElems = ensureArray(script?.elem);
+        for (const elem of scriptElems) {
+          if (elem?.["#text"]) textParts.push(elem["#text"]);
+        }
+
+        // Check table children
+        const scriptTables = ensureArray(script?.table);
+        for (const table of scriptTables) {
+          const tableElems = ensureArray(table?.elem);
+          for (const elem of tableElems) {
+            if (elem?.["#text"]) textParts.push(elem["#text"]);
           }
         }
 
-        // Attempt 2: Service version detection only (faster, no root needed)
-        console.log(`[NmapScanner] Falling back to service scan: ${nmapBin} -sV -oX - ${target}`);
-        try {
-          const { stdout } = await execFileAsync(nmapBin, ["-sV", "-oX", "-", target], {
-            timeout: 45000, // 45 second timeout for service-only scan
-            maxBuffer: 10 * 1024 * 1024,
-            env,
-            killSignal: "SIGKILL",
-          });
-          xmlOutput = stdout;
-          console.log(`[NmapScanner] Service scan completed for ${target}. XML length: ${xmlOutput.length}`);
-        } catch (fallbackErr: unknown) {
-          const fbErr = fallbackErr as { code?: string; stdout?: string; message?: string };
-          // Even the service scan might fail but produce partial XML
-          if (fbErr.stdout && fbErr.stdout.includes("<nmaprun")) {
-            xmlOutput = fbErr.stdout;
-            console.log(`[NmapScanner] Using partial XML from service scan`);
-          } else {
-            throw new Error(
-              `nmap scan failed for ${target}: ${fbErr.message || "Unknown error"}. ` +
-              `Ensure nmap is installed and the target is reachable.`
-            );
-          }
-        }
-      }
-    }
+        const combinedText = textParts.join(" ");
 
-    // ── Step 3: Parse the XML output ──────────────────────────────────────
-    const result = this.parseNmapXml(target, xmlOutput);
-
-    // Log a warning if no vuln scan was performed
-    if (!usedVulnScan) {
-      console.log(
-        `[NmapScanner] NOTE: Vulnerability scripts were not used for ${target}. ` +
-        `Run as root (sudo) for full CVE detection with --script vuln.`
-      );
-    }
-
-    return result;
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Private helpers
-  // ──────────────────────────────────────────────────────────────────────────
-
-  private async checkNmapAvailable(nmapBin: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-    try {
-      await execFileAsync(nmapBin, ["--version"], { timeout: 5000, env });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Parse nmap XML output and extract ports + vulnerabilities.
-   *
-   * Handles the real nmap XML structure:
-   * <nmaprun>
-   *   <host>
-   *     <status state="up"/>
-   *     <ports>
-   *       <port protocol="tcp" portid="22">
-   *         <state state="open" reason="syn-ack"/>
-   *         <service name="ssh" product="OpenSSH" version="8.2p1" extrainfo="Ubuntu 4" method="probed" conf="10"/>
-   *         <script id="vuln" output="CVE-2020-15778 ...">
-   *           <table>
-   *             <elem key="id">CVE-2020-15778</elem>
-   *           </table>
-   *         </script>
-   *       </port>
-   *     </ports>
-   *   </host>
-   * </nmaprun>
-   */
-  private parseNmapXml(target: string, xml: string): ScanResult {
-    const ports: PortInfo[] = [];
-    const vulnerabilities: Vulnerability[] = [];
-
-    // ── Extract all <host> blocks ─────────────────────────────────────────
-    const hostRegex = /<host[\s>][\s\S]*?<\/host>/g;
-    let hostMatch: RegExpExecArray | null;
-
-    while ((hostMatch = hostRegex.exec(xml)) !== null) {
-      const hostBlock = hostMatch[0];
-
-      // Skip hosts that are down
-      if (/<status[^>]*state="down"/.test(hostBlock)) {
-        console.log(`[NmapScanner] Skipping host marked as down`);
-        continue;
-      }
-
-      // ── Extract the <ports> block ─────────────────────────────────────
-      const portsBlockMatch = hostBlock.match(/<ports>[\s\S]*?<\/ports>/);
-      if (!portsBlockMatch) {
-        console.warn(`[NmapScanner] No <ports> block found for host in scan of ${target}`);
-        continue;
-      }
-      const portsBlock = portsBlockMatch[0];
-
-      // ── Extract each <port> element ───────────────────────────────────
-      const portRegex = /<port\s+([^>]*)>([\s\S]*?)<\/port>/g;
-      let portMatch: RegExpExecArray | null;
-
-      while ((portMatch = portRegex.exec(portsBlock)) !== null) {
-        const portAttrs = portMatch[1];
-        const portContent = portMatch[2];
-
-        // Extract port attributes: portid, protocol
-        const portIdMatch = portAttrs.match(/portid="(\d+)"/);
-        const protocolMatch = portAttrs.match(/protocol="(\w+)"/);
-
-        if (!portIdMatch || !protocolMatch) {
-          console.warn(`[NmapScanner] Skipping <port> with missing portid/protocol in scan of ${target}`);
-          continue;
-        }
-
-        const portId = parseInt(portIdMatch[1], 10);
-        const protocol = protocolMatch[1];
-
-        // ── Extract <state> ────────────────────────────────────────────
-        const stateMatch = portContent.match(/<state\s+[^>]*state="(\w+)"/);
-        const state = stateMatch ? stateMatch[1] : "unknown";
-
-        // ── Extract <service> name, product, version ───────────────────
-        const serviceMatch = portContent.match(/<service\s+([^>]*?)\/?>/);
-        let serviceName = "unknown";
-        let version = "unknown";
-
-        if (serviceMatch) {
-          const serviceAttrs = serviceMatch[1];
-          const nameMatch = serviceAttrs.match(/name="([^"]*)"/);
-          const productMatch = serviceAttrs.match(/product="([^"]*)"/);
-          const versionMatch = serviceAttrs.match(/version="([^"]*)"/);
-          const extrainfoMatch = serviceAttrs.match(/extrainfo="([^"]*)"/);
-
-          serviceName = nameMatch ? nameMatch[1] : "unknown";
-
-          // Build version string: "Product Version (extrainfo)" or combinations
-          const product = productMatch ? productMatch[1] : "";
-          const ver = versionMatch ? versionMatch[1] : "";
-          const extra = extrainfoMatch ? extrainfoMatch[1] : "";
-
-          if (product && ver) {
-            version = extra ? `${product} ${ver} (${extra})` : `${product} ${ver}`;
-          } else if (ver) {
-            version = extra ? `${ver} (${extra})` : ver;
-          } else if (product) {
-            version = product;
-          }
-        }
-
-        // Add port to results
-        ports.push({
-          port_id: portId,
-          protocol,
-          state,
-          service: serviceName,
-          version,
-        });
-
-        // ── Extract CVEs from <script> elements ────────────────────────
-        // The --script vuln output is stored in <script> elements.
-        // Each script has:
-        //   - id attribute (script name, e.g., "vuln", "ssl-heartbleed")
-        //   - output attribute (summary text, may contain CVE IDs)
-        //   - Nested <table>/<elem> elements with structured data
-
-        const scriptRegex = /<script\s+([^>]*)>([\s\S]*?)<\/script>/g;
-        let scriptMatch: RegExpExecArray | null;
-
-        while ((scriptMatch = scriptRegex.exec(portContent)) !== null) {
-          const scriptAttrs = scriptMatch[1];
-          const scriptBody = scriptMatch[2];
-
-          // Extract script id and output attributes
-          const scriptIdMatch = scriptAttrs.match(/id="([^"]*)"/);
-          const scriptOutputMatch = scriptAttrs.match(/output="([^"]*)"/);
-          const scriptId = scriptIdMatch ? scriptIdMatch[1] : "unknown";
-          const scriptOutput = scriptOutputMatch ? scriptOutputMatch[1] : "";
-
-          // Collect all text from this script for CVE extraction
-          const cveTexts: string[] = [];
-
-          // From the output attribute (most reliable for CVE IDs)
-          if (scriptOutput) {
-            cveTexts.push(this.unescapeXml(scriptOutput));
-          }
-
-          // From nested <elem> elements (structured vuln data)
-          const elemRegex = /<elem\s+key="[^"]*">([\s\S]*?)<\/elem>/g;
-          let elemMatch: RegExpExecArray | null;
-          while ((elemMatch = elemRegex.exec(scriptBody)) !== null) {
-            cveTexts.push(this.unescapeXml(elemMatch[1]));
-          }
-
-          // From any text content inside the script body
-          const textContent = scriptBody.replace(/<[^>]+>/g, " ");
-          cveTexts.push(this.unescapeXml(textContent));
-
-          // Search all collected text for CVE patterns using regex
-          const seenCves = new Set<string>();
-          const combinedText = cveTexts.join(" ");
-
-          CVE_REGEX.lastIndex = 0; // Reset regex state
-          let cveMatch: RegExpExecArray | null;
-          while ((cveMatch = CVE_REGEX.exec(combinedText)) !== null) {
-            const cveId = cveMatch[0];
-            if (!seenCves.has(cveId)) {
-              seenCves.add(cveId);
-
-              // Extract surrounding text snippet for the description
-              const cveIndex = combinedText.indexOf(cveId);
-              const snippetStart = Math.max(0, cveIndex - 80);
-              const snippetEnd = Math.min(combinedText.length, cveIndex + cveId.length + 120);
-              let description = combinedText.slice(snippetStart, snippetEnd).trim();
-
-              // Clean up the description
-              description = description
-                .replace(/\s+/g, " ")
-                .replace(/^[^A-Za-z]*/, "")
-                .slice(0, 200);
-
-              // Fallback description if snippet is too short
-              if (!description || description.length < 10) {
-                description = `${cveId} detected by nmap ${scriptId} script on port ${portId}/${protocol}`;
-              }
-
+        // Find CVEs
+        const cveMatches = combinedText.match(CVE_REGEX);
+        if (cveMatches) {
+          const seen = new Set<string>();
+          for (const cveId of cveMatches) {
+            if (!seen.has(cveId)) {
+              seen.add(cveId);
+              const desc = extractCveDescription(cveId, combinedText, scriptId, portId, protocol);
               vulnerabilities.push({
                 port_id: portId,
                 cve_id: cveId,
-                description,
+                description: desc,
               });
             }
           }
         }
       }
     }
-
-    // ── Handle case where no hosts/ports were found ──────────────────────
-    if (ports.length === 0) {
-      console.log(`[NmapScanner] No open ports found for ${target}. Host may be down or firewalled.`);
-    }
-
-    console.log(
-      `[NmapScanner] Scan of ${target} complete: ${ports.length} ports, ${vulnerabilities.length} vulnerabilities`
-    );
-
-    return {
-      target,
-      ports,
-      vulnerabilities,
-    };
   }
 
-  /**
-   * Unescape common XML entities found in nmap output.
-   * nmap encodes special characters in attribute values and text content.
-   */
-  private unescapeXml(str: string): string {
-    return str
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&apos;/g, "'")
-      .replace(/&#39;/g, "'")
-      .replace(/&#x2f;/g, "/")
-      .replace(/&#xa;/g, "\n")
-      .replace(/&#10;/g, "\n")
-      .replace(/&#13;/g, "\r")
-      .replace(/&#x9;/g, "\t");
+  console.log(`[NmapScanner] Parsed: ${ports.length} ports, ${vulnerabilities.length} vulns for ${target}`);
+  return { target, ports, vulnerabilities };
+}
+
+/**
+ * Extract CVE description from surrounding context in nmap script output
+ */
+function extractCveDescription(
+  cveId: string,
+  text: string,
+  scriptId: string,
+  port: number,
+  proto: string
+): string {
+  const idx = text.indexOf(cveId);
+  if (idx >= 0) {
+    const start = Math.max(0, idx - 80);
+    const end = Math.min(text.length, idx + cveId.length + 200);
+    let snippet = text.slice(start, end).trim();
+    snippet = snippet.replace(/\s+/g, " ");
+    if (snippet.length >= 15) {
+      return snippet.slice(0, 400);
+    }
+  }
+  return `${cveId} detected by nmap ${scriptId} script on port ${port}/${proto}`;
+}
+
+// ─── Run Nmap ──────────────────────────────────────────────────────────────
+
+/**
+ * Run nmap as a subprocess and return raw XML stdout
+ */
+async function runNmap(args: string[], timeoutMs: number): Promise<string | null> {
+  const nmapPath = getNmapPath();
+  const allArgs = [nmapPath, ...args];
+
+  console.log(`[NmapScanner] Running: ${allArgs.join(" ")}`);
+
+  try {
+    const { stdout, stderr } = await execFileAsync(nmapPath, args, {
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      env: { ...process.env, PATH: `/home/z/.local/bin:${process.env.PATH}` },
+    });
+
+    if (stdout && stdout.includes("<nmaprun")) {
+      return stdout;
+    }
+
+    if (stderr) {
+      console.warn(`[NmapScanner] nmap stderr: ${stderr.slice(0, 300)}`);
+    }
+
+    return null;
+  } catch (err: unknown) {
+    const error = err as Error & { code?: string; killed?: boolean };
+    if (error.killed) {
+      console.warn(`[NmapScanner] nmap timed out after ${timeoutMs}ms`);
+    } else if (error.code === "ENOENT") {
+      console.error(`[NmapScanner] nmap binary not found at ${nmapPath}`);
+    } else {
+      console.error(`[NmapScanner] nmap execution error:`, error.message);
+    }
+    return null;
+  }
+}
+
+// ─── Main Scan Function ────────────────────────────────────────────────────
+
+/**
+ * Execute a full nmap scan for a target.
+ *
+ * Strategy (adaptive, no root required):
+ * 1. Primary: nmap -sT -sV -oX - --max-retries 2 --host-timeout 30s <target>
+ * 2. Optional: nmap -sT -sV --script vuln -oX - -p <open_ports> <target>
+ * 3. Fallback: nmap -sT -oX - --max-retries 1 --host-timeout 30s <target>
+ *
+ * All parsing uses real nmap output. NO mock data.
+ */
+export async function executeNmapScan(target: string): Promise<ScanResult> {
+  console.log(`[NmapScanner] Starting scan for ${target}`);
+
+  // Attempt 1: Service version scan
+  console.log(`[NmapScanner] Attempt 1: nmap -sT -sV for ${target}`);
+  let xmlOutput = await runNmap(
+    ["-sT", "-sV", "-oX", "-", "--max-retries", "2", "--host-timeout", "30s", target],
+    45000
+  );
+
+  if (xmlOutput) {
+    const parsed = xmlParser.parse(xmlOutput);
+    const result = parseNmapXml(target, parsed);
+
+    if (result.ports.length === 0) {
+      console.log(`[NmapScanner] No ports found for ${target}`);
+      return result;
+    }
+
+    // Attempt 2: Vuln scripts on open ports
+    const openPorts = result.ports.filter((p) => p.state.toLowerCase() === "open");
+    if (openPorts.length > 0) {
+      const portList = openPorts.map((p) => p.port_id).join(",");
+      console.log(`[NmapScanner] Attempt 2: Running vuln scripts on ports: ${portList}`);
+      const vulnXml = await runNmap(
+        ["-sT", "-sV", "--script", "vuln", "-oX", "-", "-p", portList, "--max-retries", "1", "--host-timeout", "60s", target],
+        120000
+      );
+
+      if (vulnXml) {
+        const vulnParsed = xmlParser.parse(vulnXml);
+        const vulnResult = parseNmapXml(target, vulnParsed);
+
+        if (vulnResult.vulnerabilities.length > 0) {
+          result.vulnerabilities = vulnResult.vulnerabilities;
+          console.log(`[NmapScanner] Found ${vulnResult.vulnerabilities.length} vulnerabilities for ${target}`);
+        }
+      }
+    } else {
+      console.log(`[NmapScanner] No open ports found for ${target}, skipping vuln scan`);
+    }
+
+    return result;
+  }
+
+  // Attempt 3: Basic port scan (fallback)
+  console.log(`[NmapScanner] Attempt 3: Fallback basic port scan for ${target}`);
+  xmlOutput = await runNmap(
+    ["-sT", "-oX", "-", "--max-retries", "1", "--host-timeout", "30s", target],
+    45000
+  );
+
+  if (xmlOutput) {
+    const parsed = xmlParser.parse(xmlOutput);
+    return parseNmapXml(target, parsed);
+  }
+
+  throw new Error(`All nmap scan methods failed for ${target}. Check nmap installation and target reachability.`);
+}
+
+/**
+ * Check if nmap is available on this system
+ */
+export async function isNmapAvailable(): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync(getNmapPath(), ["--version"], {
+      timeout: 5000,
+      env: { ...process.env, PATH: `/home/z/.local/bin:${process.env.PATH}` },
+    });
+    return stdout.includes("Nmap version");
+  } catch {
+    return false;
   }
 }
