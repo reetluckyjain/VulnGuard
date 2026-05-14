@@ -7,8 +7,9 @@ SCAN_ID="$1"
 TARGET="$2"
 PORT="${3:-80}"
 TMP_DIR="/tmp/vulnguard-scans"
-NIKTO="perl /home/z/nikto-install/nikto/program/nikto.pl"
-export PERL5LIB="/home/z/perl5/lib/perl5:/home/z/perl5/lib/perl5/x86_64-linux-gnu-thread-multi"
+
+# Auto-detect nikto from PATH
+NIKTO="$(command -v nikto 2>/dev/null || echo '/usr/bin/nikto')"
 
 CSV_FILE="${TMP_DIR}/${SCAN_ID}-nikto.csv"
 STATUS_FILE="${TMP_DIR}/${SCAN_ID}.status"
@@ -30,7 +31,7 @@ if [ ! -f "$CSV_FILE" ] || [ ! -s "$CSV_FILE" ]; then
     exit 1
 fi
 
-# Verify CSV has at least 3 lines (header + target + at least one finding)
+# Verify CSV has at least 2 lines (header + at least one finding)
 LINE_COUNT=$(wc -l < "$CSV_FILE" 2>/dev/null || echo "0")
 if [ "$LINE_COUNT" -lt 2 ]; then
     echo "error:nikto output was incomplete" > "$STATUS_FILE"

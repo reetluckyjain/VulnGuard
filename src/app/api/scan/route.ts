@@ -3,7 +3,7 @@ import { db } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
 import { execSync } from "child_process";
 import { readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
-import { join } from "path";
+import { join, resolve } from "path";
 
 /**
  * POST /api/scan — Create and execute a new scan
@@ -414,7 +414,7 @@ export async function POST(request: NextRequest) {
 
     if (effectiveScanType === "nikto") {
       // Spawn Nikto via standalone shell script
-      const scriptPath = "/home/z/my-project/run-nikto-scan.sh";
+      const scriptPath = resolve(process.cwd(), "run-nikto-scan.sh");
       const scanPort = port || "80";
       try {
         execSync(
@@ -434,7 +434,7 @@ export async function POST(request: NextRequest) {
       console.log(`[API] Spawned nikto script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
     } else {
       // Spawn nmap via standalone shell script
-      const scriptPath = "/home/z/my-project/run-nmap-scan.sh";
+      const scriptPath = resolve(process.cwd(), "run-nmap-scan.sh");
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} &>/tmp/vulnguard-nmap-${scanId}.log &`,
@@ -443,7 +443,6 @@ export async function POST(request: NextRequest) {
             shell: "/bin/bash",
             env: {
               ...process.env,
-              PATH: `/home/z/.local/bin:${process.env.PATH}`,
               HOME: process.env.HOME || "/home/z",
             },
           }
