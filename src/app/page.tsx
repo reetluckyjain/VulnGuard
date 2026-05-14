@@ -7,6 +7,7 @@ import {
   RotateCcw, ExternalLink, AlertCircle, CheckCircle2, Wifi,
   WifiOff, Loader2, Info, Globe, Bug, FileWarning, ExternalLinkIcon,
   Sparkles, Terminal, Copy, Check, Zap, Wrench,
+  Fingerprint, Calendar, Play, Pause, Trash2, Timer, KeyRound,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -53,6 +54,29 @@ interface RemediationData {
 
 interface ScanHistoryEntry {
   id: string; target: string; scanType: 'nmap' | 'nikto'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
+}
+
+interface VerificationData {
+  target: string
+  verificationCode: string
+  txtRecordName: string
+  txtRecordValue: string
+  instructions: string
+  expiresAt: string
+}
+
+interface VerificationStatus {
+  target: string
+  status: 'unverified' | 'pending' | 'verified' | 'expired' | 'ip_address' | 'not_found'
+  verificationCode?: string
+  verifiedAt?: string | null
+  expiresAt?: string
+}
+
+interface ScheduleEntry {
+  id: string; target: string; scanType: string; port: string
+  frequency: string; isActive: boolean
+  lastRunAt: string | null; nextRunAt: string; createdAt: string
 }
 
 function isNiktoResult(result: ScanResult | null): result is NiktoScanResult {
@@ -112,6 +136,21 @@ export default function Home() {
   const [isRemediating, setIsRemediating] = useState(false)
   const [remediationError, setRemediationError] = useState('')
   const [copiedIdx, setCopiedIdx] = useState<string | null>(null)
+
+  // Verification state
+  const [verificationData, setVerificationData] = useState<VerificationData | null>(null)
+  const [verificationStatus, setVerificationStatus] = useState<VerificationStatus | null>(null)
+  const [isVerifying, setIsVerifying] = useState(false)
+  const [isGeneratingCode, setIsGeneratingCode] = useState(false)
+
+  // Scheduling state
+  const [schedules, setSchedules] = useState<ScheduleEntry[]>([])
+  const [scheduleTarget, setScheduleTarget] = useState('')
+  const [scheduleScanType, setScheduleScanType] = useState<'nmap' | 'nikto'>('nmap')
+  const [scheduleFrequency, setScheduleFrequency] = useState('daily')
+  const [isCreatingSchedule, setIsCreatingSchedule] = useState(false)
+
+  const isIPAddress = (t: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t)
 
   // Nmap stats
   const nmapResult = scanResult && !isNiktoResult(scanResult) ? scanResult as NmapScanResult : null
@@ -235,7 +274,116 @@ export default function Home() {
   const loadHistoryResult = (entry: ScanHistoryEntry) => {
     if (entry.results) { setScanResult(entry.results); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   }
-  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null); setRemediation(null); setRemediationError('') }
+  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null); setRemediation(null); setRemediationError(''); setVerificationData(null); setVerificationStatus(null) }
+
+  // ─── Verification handlers ────────────────────────────────────────────
+  const handleGenerateVerification = useCallback(async () => {
+    if (!target.trim()) { setValidationError('Enter a target domain first'); return }
+    if (isIPAddress(target.trim())) { setValidationError('DNS verification is for domain names only. IP addresses use checkbox authorization.'); return }
+    setIsGeneratingCode(true)
+    try {
+      const response = await fetch('/api/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: target.trim() }),
+      })
+      const data = await response.json() as Record<string, unknown>
+      if (!response.ok) throw new Error((data as Record<string,string>).error || 'Verification failed')
+      if ((data as Record<string,string>).status === 'verified') {
+        setVerificationStatus({ target: target.trim(), status: 'verified', verifiedAt: (data as Record<string,string>).verifiedAt })
+        toast({ title: 'Already Verified', description: `${target.trim()} is already verified` })
+      } else {
+        setVerificationData(data as unknown as VerificationData)
+        setVerificationStatus({ target: target.trim(), status: 'pending', verificationCode: (data as Record<string,string>).verificationCode })
+        toast({ title: 'Verification Code Generated', description: 'Add the DNS TXT record, then click Verify DNS' })
+      }
+    } catch (err) {
+      toast({ title: 'Verification Failed', description: err instanceof Error ? err.message : 'Failed', variant: 'destructive' })
+    } finally { setIsGeneratingCode(false) }
+  }, [target])
+
+  const handleVerifyDns = useCallback(async () => {
+    if (!target.trim()) return
+    setIsVerifying(true)
+    try {
+      const response = await fetch('/api/verify', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: target.trim() }),
+      })
+      const data = await response.json() as Record<string, unknown>
+      if ((data as Record<string,string>).status === 'verified') {
+        setVerificationStatus({ target: target.trim(), status: 'verified', verifiedAt: (data as Record<string,string>).verifiedAt as string })
+        toast({ title: 'Target Verified!', description: `${target.trim()} is now verified via DNS TXT` })
+      } else {
+        toast({ title: 'DNS Not Found', description: (data as Record<string,string>).message || 'TXT record not found yet. DNS propagation may take a few minutes.', variant: 'destructive' })
+      }
+    } catch (err) {
+      toast({ title: 'Verification Check Failed', description: err instanceof Error ? err.message : 'Failed', variant: 'destructive' })
+    } finally { setIsVerifying(false) }
+  }, [target])
+
+  // ─── Schedule handlers ────────────────────────────────────────────────
+  const loadSchedules = useCallback(async () => {
+    try {
+      const response = await fetch('/api/schedules')
+      if (response.ok) {
+        const data = await response.json() as Record<string, unknown>
+        setSchedules((data.schedules as ScheduleEntry[]) || [])
+      }
+    } catch { /* ignore */ }
+  }, [])
+
+  const handleCreateSchedule = useCallback(async () => {
+    if (!scheduleTarget.trim()) { toast({ title: 'Error', description: 'Enter a target domain', variant: 'destructive' }); return }
+    setIsCreatingSchedule(true)
+    try {
+      const response = await fetch('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: scheduleTarget.trim(), scanType: scheduleScanType, port: scheduleScanType === 'nikto' ? '80' : undefined, frequency: scheduleFrequency }),
+      })
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({})) as Record<string, string>
+        throw new Error(err.error || 'Failed')
+      }
+      toast({ title: 'Schedule Created', description: `${scheduleFrequency} ${scheduleScanType} scan for ${scheduleTarget.trim()}` })
+      setScheduleTarget('')
+      loadSchedules()
+    } catch (err) {
+      toast({ title: 'Schedule Failed', description: err instanceof Error ? err.message : 'Failed', variant: 'destructive' })
+    } finally { setIsCreatingSchedule(false) }
+  }, [scheduleTarget, scheduleScanType, scheduleFrequency, loadSchedules])
+
+  const handleToggleSchedule = useCallback(async (id: string, isActive: boolean) => {
+    try {
+      await fetch(`/api/schedules?id=${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ isActive: !isActive }) })
+      loadSchedules()
+    } catch { /* ignore */ }
+  }, [loadSchedules])
+
+  const handleDeleteSchedule = useCallback(async (id: string) => {
+    try {
+      await fetch(`/api/schedules?id=${id}`, { method: 'DELETE' })
+      loadSchedules()
+      toast({ title: 'Schedule Deleted' })
+    } catch { /* ignore */ }
+  }, [loadSchedules])
+
+  useEffect(() => { loadSchedules() }, [loadSchedules])
+
+  // Check verification status when target changes
+  useEffect(() => {
+    if (!target.trim() || isIPAddress(target.trim())) { setVerificationStatus(null); return }
+    const check = async () => {
+      try {
+        const r = await fetch(`/api/verify?target=${encodeURIComponent(target.trim())}`)
+        if (r.ok) { const d = await r.json() as VerificationStatus; setVerificationStatus(d) }
+      } catch { /* ignore */ }
+    }
+    const t = setTimeout(check, 500)
+    return () => clearTimeout(t)
+  }, [target])
 
   const handleGetRemediation = useCallback(async () => {
     if (!scanResult) return
@@ -299,6 +447,7 @@ export default function Home() {
               <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />Real Data Only</Badge>
               <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">Nmap + Nikto</Badge>
               <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30"><Sparkles className="h-3 w-3 mr-1" />AI Remediation</Badge>
+              <Badge variant="outline" className="text-xs bg-cyan-500/10 text-cyan-400 border-cyan-500/30"><Fingerprint className="h-3 w-3 mr-1" />DNS Verify</Badge>
             </div>
           </div>
         </div>
@@ -355,6 +504,20 @@ export default function Home() {
                 <div className="flex flex-col sm:flex-row gap-3">
                   <div className="flex-1">
                     <Input type="text" placeholder={scanType === 'nikto' ? 'e.g., scanme.nmap.org or 192.168.1.1' : 'e.g., scanme.nmap.org or 192.168.1.1'} value={target} onChange={e => { setTarget(e.target.value); if (validationError) setValidationError('') }} onKeyDown={e => { if (e.key === 'Enter') handleStartScan() }} disabled={isScanning} className="font-mono" aria-label="Target IP or hostname" />
+                    {/* Verification status indicator */}
+                    {target.trim() && !isIPAddress(target.trim()) && verificationStatus && (
+                      <div className="flex items-center gap-1.5 mt-1.5">
+                        {verificationStatus.status === 'verified' ? (
+                          <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />DNS Verified</Badge>
+                        ) : verificationStatus.status === 'pending' ? (
+                          <Badge variant="outline" className="text-xs bg-yellow-500/10 text-yellow-400 border-yellow-500/30"><KeyRound className="h-3 w-3 mr-1" />Verification Pending</Badge>
+                        ) : verificationStatus.status === 'expired' ? (
+                          <Badge variant="outline" className="text-xs bg-red-500/10 text-red-400 border-red-500/30"><AlertCircle className="h-3 w-3 mr-1" />Verification Expired</Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-xs bg-orange-500/10 text-orange-400 border-orange-500/30"><Fingerprint className="h-3 w-3 mr-1" />DNS Verification Required</Badge>
+                        )}
+                      </div>
+                    )}
                     {validationError && <p className="text-sm text-red-400 mt-1.5 flex items-center gap-1.5"><AlertCircle className="h-3.5 w-3.5" />{validationError}</p>}
                   </div>
                   <div className="flex gap-2">
@@ -373,6 +536,137 @@ export default function Home() {
                   )}
                 </div>
               </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        {/* ─── DNS Verification Gate ───────────────────────────────────────── */}
+        {target.trim() && !isIPAddress(target.trim()) && verificationStatus?.status !== 'verified' && (
+          <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+            <Card className="border-cyan-500/30 bg-gradient-to-br from-cyan-500/5 via-transparent to-transparent">
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-2"><Fingerprint className="h-4 w-4 text-cyan-400" />Target Ownership Verification</CardTitle>
+                <CardDescription>Prove you own this domain by adding a DNS TXT record. This prevents unauthorized scanning of third-party targets.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {!verificationData ? (
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                    <p className="text-sm text-muted-foreground flex-1">Generate a unique verification code, add it as a DNS TXT record, then verify ownership.</p>
+                    <Button onClick={handleGenerateVerification} disabled={isGeneratingCode} className="bg-cyan-600 hover:bg-cyan-700 text-white min-w-[180px]">
+                      {isGeneratingCode ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <KeyRound className="h-4 w-4 mr-2" />}
+                      {isGeneratingCode ? 'Generating...' : 'Generate Code'}
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="rounded-lg border border-cyan-500/20 bg-muted/20 p-4 space-y-3">
+                      <p className="text-sm font-medium">Add this DNS TXT record to your domain:</p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="rounded bg-zinc-950 border border-zinc-800 p-2.5">
+                          <p className="text-xs text-zinc-500 mb-1">Name / Host</p>
+                          <p className="text-sm font-mono text-cyan-400">{verificationData.txtRecordName}</p>
+                        </div>
+                        <div className="rounded bg-zinc-950 border border-zinc-800 p-2.5 relative group">
+                          <p className="text-xs text-zinc-500 mb-1">Value / TXT Data</p>
+                          <p className="text-sm font-mono text-emerald-400">{verificationData.txtRecordValue}</p>
+                          <button onClick={() => copyToClipboard(verificationData.txtRecordValue, 'verify-code')} className="absolute top-2 right-2 p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100" aria-label="Copy code">
+                            {copiedIdx === 'verify-code' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                          </button>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">Code expires: {new Date(verificationData.expiresAt).toLocaleString()}</p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <Button onClick={handleVerifyDns} disabled={isVerifying} className="bg-cyan-600 hover:bg-cyan-700 text-white min-w-[160px]">
+                        {isVerifying ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-2" />}
+                        {isVerifying ? 'Checking DNS...' : 'Verify DNS'}
+                      </Button>
+                      <Button variant="outline" onClick={handleGenerateVerification} disabled={isGeneratingCode} className="text-xs">
+                        <RotateCcw className="h-3.5 w-3.5 mr-1.5" />Regenerate Code
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
+        {/* ─── Scheduled Scans ──────────────────────────────────────────────── */}
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: 0.15 }}>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base flex items-center gap-2"><Calendar className="h-4 w-4 text-primary" />Scheduled Scans</CardTitle>
+              <CardDescription>Set up recurring scans for continuous monitoring. Only verified targets can be scheduled.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {/* Create schedule form */}
+              <div className="flex flex-col sm:flex-row gap-3 items-end">
+                <div className="flex-1">
+                  <label className="text-xs text-muted-foreground mb-1 block">Target Domain</label>
+                  <Input type="text" value={scheduleTarget} onChange={e => setScheduleTarget(e.target.value)} placeholder="e.g., example.com" className="font-mono text-sm" aria-label="Schedule target" />
+                </div>
+                <div className="w-[130px]">
+                  <label className="text-xs text-muted-foreground mb-1 block">Engine</label>
+                  <Select value={scheduleScanType} onValueChange={v => setScheduleScanType(v as 'nmap' | 'nikto')}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="nmap">Nmap</SelectItem>
+                      <SelectItem value="nikto">Nikto</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-[130px]">
+                  <label className="text-xs text-muted-foreground mb-1 block">Frequency</label>
+                  <Select value={scheduleFrequency} onValueChange={setScheduleFrequency}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="hourly">Hourly</SelectItem>
+                      <SelectItem value="daily">Daily</SelectItem>
+                      <SelectItem value="weekly">Weekly</SelectItem>
+                      <SelectItem value="monthly">Monthly</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Button onClick={handleCreateSchedule} disabled={isCreatingSchedule || !scheduleTarget.trim()} className="bg-primary hover:bg-primary/90 text-primary-foreground min-w-[120px]">
+                  {isCreatingSchedule ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Timer className="h-4 w-4 mr-2" />}
+                  {isCreatingSchedule ? 'Creating...' : 'Schedule'}
+                </Button>
+              </div>
+
+              {/* Schedule list */}
+              {schedules.length > 0 ? (
+                <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+                  {schedules.map((schedule) => (
+                    <div key={schedule.id} className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 p-3 rounded-lg border border-border/50 bg-muted/20 hover:bg-muted/30 transition-colors">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-sm font-medium">{schedule.target}</span>
+                          <Badge variant="outline" className="text-xs">{schedule.scanType}</Badge>
+                          <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">{schedule.frequency}</Badge>
+                          <Badge variant="outline" className={schedule.isActive ? 'text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'text-xs bg-muted text-muted-foreground border-border'}>
+                            {schedule.isActive ? 'Active' : 'Paused'}
+                          </Badge>
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          Next: {new Date(schedule.nextRunAt).toLocaleString()}
+                          {schedule.lastRunAt && <> · Last: {new Date(schedule.lastRunAt).toLocaleString()}</>}
+                        </p>
+                      </div>
+                      <div className="flex gap-1.5 shrink-0">
+                        <Button variant="ghost" size="sm" onClick={() => handleToggleSchedule(schedule.id, schedule.isActive)} className="h-8 w-8 p-0">
+                          {schedule.isActive ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => handleDeleteSchedule(schedule.id)} className="h-8 w-8 p-0 text-red-400 hover:text-red-300">
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground text-center py-4">No scheduled scans yet. Create one above for continuous monitoring.</p>
+              )}
             </CardContent>
           </Card>
         </motion.div>

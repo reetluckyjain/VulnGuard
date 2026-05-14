@@ -30,6 +30,10 @@ function verifyAuthorization(target: string): { authorized: boolean; reason?: st
   return { authorized: true };
 }
 
+function isIPAddress(target: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(target);
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface PortInfo { port_id: number; protocol: string; state: string; service: string; version: string }
@@ -378,6 +382,25 @@ export async function POST(request: NextRequest) {
     const auth = verifyAuthorization(targetTrimmed);
     if (!auth.authorized) {
       return NextResponse.json({ error: auth.reason || "Target not authorized for scanning" }, { status: 403 });
+    }
+
+    // ─── DNS Verification Gate ────────────────────────────────────────────
+    // Domain targets (not IPs) must be verified via DNS TXT record
+    // unless skipVerification is set (used by scheduler)
+    const skipVerification = body.skipVerification === true;
+
+    if (!isIPAddress(targetTrimmed) && !skipVerification) {
+      const verification = await db.targetVerification.findUnique({
+        where: { target: targetTrimmed },
+      });
+
+      if (!verification || verification.status !== "verified") {
+        return NextResponse.json({
+          error: "Target domain is not verified. Complete DNS TXT verification before scanning.",
+          needsVerification: true,
+          target: targetTrimmed,
+        }, { status: 403 });
+      }
     }
 
     const effectiveScanType = scanType === "nikto" ? "nikto" : "nmap";

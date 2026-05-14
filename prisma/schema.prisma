@@ -40,3 +40,27 @@ model Scan {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+model TargetVerification {
+  id              String   @id @default(uuid())
+  target          String   @unique
+  verificationCode String
+  status          String   @default("pending")  // pending | verified | expired
+  verifiedAt      DateTime?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model Schedule {
+  id          String   @id @default(uuid())
+  target      String
+  scanType    String   @default("nmap")
+  port        String   @default("80")
+  frequency   String   // hourly | daily | weekly | monthly
+  isActive    Boolean  @default(true)
+  lastRunAt   DateTime?
+  nextRunAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

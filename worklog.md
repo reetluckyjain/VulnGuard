@@ -178,3 +178,50 @@ Stage Summary:
 - JSON contract: {summary, risk_level, remediations: [{finding, severity, explanation, fix_commands, references}], hardening_recommendations}
 - LLM response time: ~26 seconds for a typical scan with 2 services
 - Real data only — no mocks, AI generates context-specific remediation based on actual scan findings
+---
+Task ID: 12
+Agent: Main Agent
+Task: Implement Target Ownership Verification (DNS TXT) and Scheduling Engine (Cron)
+
+Work Log:
+- Updated Prisma schema with TargetVerification and Schedule models
+- Ran db:push to sync schema to SQLite database
+- Created /src/app/api/verify/route.ts — DNS TXT verification API
+  - POST: generates unique vg-verify-XXXXXXXX code, stores in DB with 48h expiry
+  - PUT: checks DNS TXT records using `dig -t TXT` command
+  - GET: checks verification status for a target
+  - IP addresses bypass DNS verification (use checkbox authorization)
+- Created /src/app/api/schedules/route.ts — Schedule CRUD API
+  - POST: create schedule (target, scanType, frequency: hourly/daily/weekly/monthly)
+  - GET: list all schedules
+  - PUT: update schedule (toggle active, change frequency)
+  - DELETE: delete schedule
+- Updated /src/app/api/scan/route.ts — added DNS verification gate
+  - Domain targets must be verified before scanning (403 if not verified)
+  - IP addresses bypass verification
+  - skipVerification flag for scheduler-initiated scans
+- Created /mini-services/scheduler/ — Cron runner service on port 3004
+  - Reads due schedules directly from SQLite every 60 seconds
+  - Triggers scans via Next.js API with skipVerification=true
+  - Recalculates nextRunAt after each scan
+  - Health check endpoint at /health, manual trigger at /trigger
+- Updated /src/app/page.tsx — Full frontend for verification and scheduling
+  - Added new types: VerificationData, VerificationStatus, ScheduleEntry
+  - Added verification state and handlers (generate code, verify DNS, check status)
+  - Added schedule state and handlers (create, toggle, delete, load)
+  - Auto-checks verification status when target input changes
+  - Shows verification status badge next to target input (Verified/Pending/Required/Expired)
+  - Added DNS Verification Gate card (cyan-themed) with code display + copy button
+  - Added Scheduled Scans card with create form and schedule list (pause/resume/delete)
+  - Added "DNS Verify" badge in header
+- All lint checks pass
+
+Stage Summary:
+- DNS TXT verification fully implemented: generate code → add TXT record → verify ownership → scan allowed
+- Domain scan gating works: unverified domains get 403, IPs bypass verification
+- Schedule CRUD API works: create/list/update/delete schedules
+- Scheduler mini-service runs on port 3004, checks every 60s for due schedules
+- Frontend shows verification flow and schedule management UI
+- Verified: curl POST to /api/scan with unverified domain returns 403 with needsVerification flag
+- Verified: /api/schedules POST creates schedule, GET lists schedules
+- Verified: /api/verify POST generates codes, GET checks status
