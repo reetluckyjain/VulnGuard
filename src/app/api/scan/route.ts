@@ -8,11 +8,14 @@ import { join } from "path";
 /**
  * POST /api/scan — Create and execute a new scan
  *
- * Spawns nmap via a standalone shell script that runs completely independently.
- * The script writes XML output to temp files, which are read by the GET route.
- * This ensures nmap survives even if the Next.js server process dies.
+ * Supports two scan types:
+ *   - nmap: Port scanning + service version detection + vuln scripts
+ *   - nikto: Web vulnerability scanning (HTTP-level checks)
  *
- * NO MOCK DATA — Real nmap scans only.
+ * Spawns the scanner via a standalone shell script that runs completely independently.
+ * The script writes output to temp files, which are read by the GET route.
+ *
+ * NO MOCK DATA — Real scans only.
  */
 
 // ─── Authorization ──────────────────────────────────────────────────────────
@@ -33,9 +36,33 @@ interface PortInfo { port_id: number; protocol: string; state: string; service: 
 interface Vulnerability { port_id: number; cve_id: string; description: string }
 interface ScanResult { target: string; ports: PortInfo[]; vulnerabilities: Vulnerability[] }
 
+// ─── Nikto-specific types ───────────────────────────────────────────────────
+
+interface NiktoFinding {
+  id: string;
+  host: string;
+  ip: string;
+  port: number;
+  method: string;
+  path: string;
+  description: string;
+  references: string[];
+}
+
+interface NiktoScanResult {
+  target: string;
+  scanType: "nikto";
+  server: string;
+  findings: NiktoFinding[];
+  vulnerabilities: Vulnerability[];
+  summary: { total: number; info: number; low: number; medium: number; high: number };
+}
+
+// ─── Shared ─────────────────────────────────────────────────────────────────
+
 const CVE_REGEX = /CVE-\d{4}-\d{4,7}/g;
 
-// ─── XML Parsing ────────────────────────────────────────────────────────────
+// ─── Nmap XML Parsing ───────────────────────────────────────────────────────
 
 function extractCveDescription(cveId: string, text: string, scriptId: string, port: number, proto: string): string {
   const idx = text.indexOf(cveId);
@@ -111,6 +138,118 @@ function parseNmapXml(target: string, xml: string): ScanResult {
   return { target, ports, vulnerabilities };
 }
 
+// ─── Nikto CSV Parsing ──────────────────────────────────────────────────────
+
+function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
+  const findings: NiktoFinding[] = [];
+  const vulnerabilities: Vulnerability[] = [];
+  let server = "Unknown";
+
+  const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    // Parse quoted CSV: "field1","field2",...
+    const fields: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        fields.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    fields.push(current);
+
+    // Header line: "Nikto - v2.6.0/"
+    if (fields.length <= 1 && fields[0]?.startsWith("Nikto")) continue;
+
+    // Data line: hostname, ip, port, references, method, path, description
+    if (fields.length >= 7) {
+      const [host, ip, portStr, references, method, path, description] = fields;
+
+      // Detect server header from description
+      if (description?.includes("appears to be outdated") || description?.includes("Server:")) {
+        const serverMatch = description.match(/(?:Server:\s*|^)([A-Za-z][^\s.]+)/);
+        if (serverMatch) server = serverMatch[1];
+      }
+
+      const port = parseInt(portStr, 10) || 80;
+
+      const finding: NiktoFinding = {
+        id: `nikto-${findings.length + 1}`,
+        host: host || target,
+        ip: ip || "",
+        port,
+        method: method || "GET",
+        path: path || "/",
+        description: description || "",
+        references: references ? references.split(",").map(r => r.trim()).filter(Boolean) : [],
+      };
+      findings.push(finding);
+
+      // Extract CVEs from references and description
+      CVE_REGEX.lastIndex = 0;
+      const allText = `${references} ${description}`;
+      const cveMatches = allText.match(CVE_REGEX);
+      if (cveMatches) {
+        const seen = new Set<string>();
+        for (const cveId of cveMatches) {
+          if (!seen.has(cveId)) {
+            seen.add(cveId);
+            const idx = allText.indexOf(cveId);
+            const start = Math.max(0, idx - 60);
+            const end = Math.min(allText.length, idx + cveId.length + 150);
+            let snippet = allText.slice(start, end).trim().replace(/\s+/g, " ");
+            if (snippet.length < 15) snippet = `${cveId} detected by Nikto on port ${port}`;
+            vulnerabilities.push({
+              port_id: port,
+              cve_id: cveId,
+              description: snippet.slice(0, 400),
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Compute summary
+  const summary = {
+    total: findings.length,
+    info: findings.filter(f =>
+      f.description.toLowerCase().includes("suggested security header") ||
+      f.description.toLowerCase().includes("uncommon header")
+    ).length,
+    low: findings.filter(f =>
+      f.description.toLowerCase().includes("outdated") ||
+      f.description.toLowerCase().includes("mod_negotiation")
+    ).length,
+    medium: findings.filter(f =>
+      f.references.length > 0 &&
+      !f.description.toLowerCase().includes("suggested security header") &&
+      !f.description.toLowerCase().includes("uncommon header")
+    ).length,
+    high: findings.filter(f =>
+      f.description.toLowerCase().includes("xss") ||
+      f.description.toLowerCase().includes("sql") ||
+      f.description.toLowerCase().includes("injection") ||
+      f.description.toLowerCase().includes("rce") ||
+      f.description.toLowerCase().includes("remote code")
+    ).length,
+  };
+
+  return { target, scanType: "nikto", server, findings, vulnerabilities, summary };
+}
+
 // ─── Temp file helpers ──────────────────────────────────────────────────────
 
 const TMP_DIR = "/tmp/vulnguard-scans";
@@ -121,9 +260,7 @@ function ensureTmpDir() {
 
 // ─── Result Processor ───────────────────────────────────────────────────────
 
-export async function processScanResults(scanId: string, target: string): Promise<{ status: string; results: ScanResult | null; error: string | null }> {
-  const xmlFile = join(TMP_DIR, `${scanId}.xml`);
-  const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
+export async function processScanResults(scanId: string, scanType: string): Promise<{ status: string; results: ScanResult | NiktoScanResult | null; error: string | null }> {
   const statusFile = join(TMP_DIR, `${scanId}.status`);
 
   // Check status file for errors
@@ -133,66 +270,86 @@ export async function processScanResults(scanId: string, target: string): Promis
       return { status: "Failed", results: null, error: status.slice(6) };
     }
     if (status === "completed") {
-      // Process the XML files
-      let result: ScanResult = { target, ports: [], vulnerabilities: [] };
+      if (scanType === "nikto") {
+        // Process Nikto CSV
+        const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
+        let result: NiktoScanResult = { target: "", scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
 
-      if (existsSync(xmlFile)) {
-        try {
-          const xml = readFileSync(xmlFile, "utf-8");
-          if (xml.includes("</nmaprun>")) {
-            result = parseNmapXml(target, xml);
-          }
-        } catch {}
-      }
-
-      // Also check vuln XML
-      if (existsSync(vulnXmlFile)) {
-        try {
-          const vulnXml = readFileSync(vulnXmlFile, "utf-8");
-          if (vulnXml.includes("</nmaprun>")) {
-            const vulnResult = parseNmapXml(target, vulnXml);
-            if (vulnResult.vulnerabilities.length > 0) {
-              result.vulnerabilities = vulnResult.vulnerabilities;
+        if (existsSync(csvFile)) {
+          try {
+            const csv = readFileSync(csvFile, "utf-8");
+            if (csv.trim().length > 0) {
+              result = parseNiktoCsv("", csv);
             }
-            // Also merge any additional ports from vuln scan
-            const existingPorts = new Set(result.ports.map(p => p.port_id));
-            for (const p of vulnResult.ports) {
-              if (!existingPorts.has(p.port_id)) {
-                result.ports.push(p);
-                existingPorts.add(p.port_id);
+          } catch (err) {
+            console.error("[API] Error parsing Nikto CSV:", err);
+          }
+        }
+
+        // Update DB
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Completed", results: JSON.stringify(result) },
+          });
+        } catch {}
+
+        // Clean up temp files
+        try { unlinkSync(csvFile); } catch {}
+        try { unlinkSync(statusFile); } catch {}
+
+        return { status: "Completed", results: result, error: null };
+      } else {
+        // Process nmap XML files
+        const xmlFile = join(TMP_DIR, `${scanId}.xml`);
+        const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
+        let result: ScanResult = { target: "", ports: [], vulnerabilities: [] };
+
+        if (existsSync(xmlFile)) {
+          try {
+            const xml = readFileSync(xmlFile, "utf-8");
+            if (xml.includes("</nmaprun>")) {
+              result = parseNmapXml("", xml);
+            }
+          } catch {}
+        }
+
+        // Also check vuln XML
+        if (existsSync(vulnXmlFile)) {
+          try {
+            const vulnXml = readFileSync(vulnXmlFile, "utf-8");
+            if (vulnXml.includes("</nmaprun>")) {
+              const vulnResult = parseNmapXml("", vulnXml);
+              if (vulnResult.vulnerabilities.length > 0) {
+                result.vulnerabilities = vulnResult.vulnerabilities;
+              }
+              const existingPorts = new Set(result.ports.map(p => p.port_id));
+              for (const p of vulnResult.ports) {
+                if (!existingPorts.has(p.port_id)) {
+                  result.ports.push(p);
+                  existingPorts.add(p.port_id);
+                }
               }
             }
-          }
+          } catch {}
+        }
+
+        // Update DB
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Completed", results: JSON.stringify(result) },
+          });
         } catch {}
+
+        // Clean up temp files
+        try { unlinkSync(xmlFile); } catch {}
+        try { unlinkSync(vulnXmlFile); } catch {}
+        try { unlinkSync(statusFile); } catch {}
+
+        return { status: "Completed", results: result, error: null };
       }
-
-      // Update DB
-      try {
-        await db.scan.update({
-          where: { id: scanId },
-          data: { status: "Completed", results: JSON.stringify(result) },
-        });
-      } catch {}
-
-      // Clean up temp files
-      try { unlinkSync(xmlFile); } catch {}
-      try { unlinkSync(vulnXmlFile); } catch {}
-      try { unlinkSync(statusFile); } catch {}
-
-      return { status: "Completed", results: result, error: null };
     }
-  }
-
-  // Check if XML file exists but nmap is still running
-  if (existsSync(xmlFile)) {
-    try {
-      const xml = readFileSync(xmlFile, "utf-8");
-      if (xml.includes("</nmaprun>")) {
-        // XML is complete but status file hasn't been updated yet
-        // This can happen if the shell script is running vuln scan
-        // Process the main scan result but don't mark as complete yet
-      }
-    } catch {}
   }
 
   return { status: "Running", results: null, error: null };
@@ -203,7 +360,7 @@ export async function processScanResults(scanId: string, target: string): Promis
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { target, isAuthorized } = body;
+    const { target, isAuthorized, scanType, port } = body;
 
     if (!target || typeof target !== "string") {
       return NextResponse.json({ error: "Target IP/hostname is required" }, { status: 400 });
@@ -223,43 +380,65 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: auth.reason || "Target not authorized for scanning" }, { status: 403 });
     }
 
+    const effectiveScanType = scanType === "nikto" ? "nikto" : "nmap";
     const scanId = uuidv4();
 
     ensureTmpDir();
 
     await db.scan.create({
-      data: { id: scanId, target: targetTrimmed, status: "Running" },
+      data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running" },
     });
 
-    // Spawn nmap via standalone shell script using nohup + background &
-    // execSync with & starts the process in background and returns immediately
-    // The nmap process runs completely independently of Next.js
-    const scriptPath = "/home/z/my-project/run-nmap-scan.sh";
-    try {
-      execSync(
-        `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} &>/tmp/vulnguard-nmap-${scanId}.log &`,
-        {
-          timeout: 5000,
-          shell: "/bin/bash",
-          env: {
-            ...process.env,
-            PATH: `/home/z/.local/bin:${process.env.PATH}`,
-            HOME: process.env.HOME || "/home/z",
-          },
-        }
-      );
-    } catch {
-      // execSync throws on non-zero exit, but background & always returns 0
-      // The nmap process is running in the background regardless
+    if (effectiveScanType === "nikto") {
+      // Spawn Nikto via standalone shell script
+      const scriptPath = "/home/z/my-project/run-nikto-scan.sh";
+      const scanPort = port || "80";
+      try {
+        execSync(
+          `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nikto-${scanId}.log &`,
+          {
+            timeout: 5000,
+            shell: "/bin/bash",
+            env: {
+              ...process.env,
+              HOME: process.env.HOME || "/home/z",
+            },
+          }
+        );
+      } catch {
+        // Background & always returns 0 — the process runs independently
+      }
+      console.log(`[API] Spawned nikto script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
+    } else {
+      // Spawn nmap via standalone shell script
+      const scriptPath = "/home/z/my-project/run-nmap-scan.sh";
+      try {
+        execSync(
+          `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} &>/tmp/vulnguard-nmap-${scanId}.log &`,
+          {
+            timeout: 5000,
+            shell: "/bin/bash",
+            env: {
+              ...process.env,
+              PATH: `/home/z/.local/bin:${process.env.PATH}`,
+              HOME: process.env.HOME || "/home/z",
+            },
+          }
+        );
+      } catch {
+        // Background & always returns 0 — the process runs independently
+      }
+      console.log(`[API] Spawned nmap script for scan ${scanId}, target ${targetTrimmed}`);
     }
-
-    console.log(`[API] Spawned nmap script for scan ${scanId}, target ${targetTrimmed}`);
 
     return NextResponse.json({
       scan_id: scanId,
       target: targetTrimmed,
+      scan_type: effectiveScanType,
       status: "Running",
-      message: "Scan initiated. Real nmap scan is running. Poll GET /api/scan/[id] for results.",
+      message: effectiveScanType === "nikto"
+        ? "Nikto web vulnerability scan initiated. Poll GET /api/scan/[id] for results."
+        : "Nmap scan initiated. Poll GET /api/scan/[id] for results.",
     }, { status: 201 });
 
   } catch (error) {
@@ -268,4 +447,4 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export { parseNmapXml };
+export { parseNmapXml, parseNiktoCsv };

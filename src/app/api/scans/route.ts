@@ -12,6 +12,7 @@ export async function GET() {
       scans: scans.map(scan => ({
         id: scan.id,
         target: scan.target,
+        scan_type: scan.scanType || "nmap",
         status: scan.status,
         created_at: scan.createdAt,
         updated_at: scan.updatedAt,

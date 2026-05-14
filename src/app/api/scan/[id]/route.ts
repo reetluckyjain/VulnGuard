@@ -5,8 +5,9 @@ import { processScanResults } from "../route";
 /**
  * GET /api/scan/[id] — Get scan status and results
  *
- * Checks for nmap XML output files and processes them into results.
- * The nmap process runs detached and writes to temp files.
+ * Checks for scanner output files and processes them into results.
+ * Supports both nmap and nikto scan types.
+ * The scanner process runs detached and writes to temp files.
  * This route reads those files and updates the DB.
  */
 
@@ -24,6 +25,8 @@ export async function GET(
       return NextResponse.json({ error: "Scan not found" }, { status: 404 });
     }
 
+    const scanType = scan.scanType || "nmap";
+
     // If already completed or failed, return from DB
     if (scan.status === "Completed") {
       let parsedResults = null;
@@ -33,6 +36,7 @@ export async function GET(
       return NextResponse.json({
         scan_id: scan.id,
         target: scan.target,
+        scan_type: scanType,
         status: "Completed",
         results: parsedResults,
         created_at: scan.createdAt,
@@ -51,6 +55,7 @@ export async function GET(
       return NextResponse.json({
         scan_id: scan.id,
         target: scan.target,
+        scan_type: scanType,
         status: "Failed",
         error,
         created_at: scan.createdAt,
@@ -58,13 +63,14 @@ export async function GET(
       });
     }
 
-    // Scan is still Running or Pending — check for nmap output files
-    const processed = await processScanResults(id);
+    // Scan is still Running or Pending — check for output files
+    const processed = await processScanResults(id, scanType);
 
     if (processed.status === "Completed" && processed.results) {
       return NextResponse.json({
         scan_id: scan.id,
         target: scan.target,
+        scan_type: scanType,
         status: "Completed",
         results: processed.results,
         created_at: scan.createdAt,
@@ -76,6 +82,7 @@ export async function GET(
       return NextResponse.json({
         scan_id: scan.id,
         target: scan.target,
+        scan_type: scanType,
         status: "Failed",
         error: processed.error || "Scan failed",
         created_at: scan.createdAt,
@@ -87,6 +94,7 @@ export async function GET(
     return NextResponse.json({
       scan_id: scan.id,
       target: scan.target,
+      scan_type: scanType,
       status: "Running",
       results: null,
       created_at: scan.createdAt,

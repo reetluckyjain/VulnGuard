@@ -95,3 +95,44 @@ Stage Summary:
 - Dev server stays alive via keep-alive script
 - All lint checks pass
 - Application is production-ready
+
+---
+Task ID: 10
+Agent: Main Agent
+Task: Integrate Nikto web vulnerability scanner into modular architecture
+
+Work Log:
+- Installed Nikto 2.6.0 from GitHub (Perl script) at /home/z/nikto-install/nikto/
+- Installed required Perl modules: JSON::PP (built-in), XML::Writer (compiled from CPAN to /home/z/perl5/)
+- Created /home/z/my-project/run-nikto-scan.sh — standalone bash script that runs Nikto with CSV output
+- Nikto uses CSV format (most reliable) with -maxtime 90s and timeout 120s
+- Updated Prisma schema: added `scanType` field (default "nmap") to Scan model
+- Ran `bun run db:push` to sync schema — new column added
+- Rewrote /src/app/api/scan/route.ts — supports both nmap and nikto scan types
+  - Added NiktoScanResult type with findings, vulnerabilities, summary (high/medium/low/info)
+  - Added parseNiktoCsv() function — parses quoted CSV fields, extracts findings + CVEs
+  - processScanResults() now handles both nmap XML and nikto CSV file processing
+  - POST handler accepts scanType and port parameters, spawns correct shell script
+- Rewrote /src/app/api/scan/[id]/route.ts — returns scan_type in response, passes scanType to processor
+- Rewrote /src/app/api/scans/route.ts — includes scan_type in list response
+- Rewrote /src/app/page.tsx — full frontend with scan type selector
+  - Select dropdown to choose between Nmap and Nikto engines
+  - Port input field for Nikto scans
+  - Nikto-specific results: severity cards (High/Medium/Low/Info), findings list with references
+  - Nmap results unchanged: port table, vulnerabilities, CVE badges
+  - Scan history shows scan type badge (nmap/nikto) for each entry
+- Rebuilt nmap 7.94 from source at /home/z/.local/bin/nmap (binary was missing)
+- Installed nmap data files to /home/z/.local/share/nmap/ and set NMAPDATADIR in script
+- Fixed isNiktoResult() null safety bug — was crashing with TypeError
+- End-to-end tested: Nikto scan of scanme.nmap.org → 9 findings (headers, mod_negotiation, outdated Apache)
+- End-to-end tested: nmap scan of scanme.nmap.org → 5 ports (SSH, SMTP, HTTP, nping-echo, tcpwrapped)
+- All lint checks pass
+
+Stage Summary:
+- Nikto web vulnerability scanner fully integrated into VulnGuard modular architecture
+- Two scan engines: Nmap (network/port) + Nikto (web/HTTP)
+- Real data only — no mocks, no simulation
+- Nikto JSON contract: {target, scanType, server, findings: [{id, host, ip, port, method, path, description, references}], vulnerabilities, summary: {total, info, low, medium, high}}
+- Nikto parses CSV output, extracts findings with severity classification, CVE references with links
+- Frontend has engine selector, Nikto-specific results display with severity cards and reference links
+- Both engines tested and working end-to-end through full chain (Caddy → Next.js → API → Scanner → Results)
