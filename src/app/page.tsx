@@ -6,6 +6,7 @@ import {
   Shield, Search, Server, AlertTriangle, Clock, ChevronRight,
   RotateCcw, ExternalLink, AlertCircle, CheckCircle2, Wifi,
   WifiOff, Loader2, Info, Globe, Bug, FileWarning, ExternalLinkIcon,
+  Sparkles, Terminal, Copy, Check, Zap, Wrench,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -33,6 +34,22 @@ interface NiktoScanResult {
 }
 
 type ScanResult = NmapScanResult | NiktoScanResult
+
+interface RemediationItem {
+  finding: string
+  severity: string
+  explanation: string
+  fix_commands: string[]
+  references: string[]
+}
+
+interface RemediationData {
+  summary: string
+  risk_level: string
+  remediations: RemediationItem[]
+  hardening_recommendations: string[]
+  raw_response?: string
+}
 
 interface ScanHistoryEntry {
   id: string; target: string; scanType: 'nmap' | 'nikto'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
@@ -91,6 +108,10 @@ export default function Home() {
   const [activeScanId, setActiveScanId] = useState<string | null>(null)
   const [pollCount, setPollCount] = useState(0)
   const [scanStatusText, setScanStatusText] = useState('Initializing...')
+  const [remediation, setRemediation] = useState<RemediationData | null>(null)
+  const [isRemediating, setIsRemediating] = useState(false)
+  const [remediationError, setRemediationError] = useState('')
+  const [copiedIdx, setCopiedIdx] = useState<string | null>(null)
 
   // Nmap stats
   const nmapResult = scanResult && !isNiktoResult(scanResult) ? scanResult as NmapScanResult : null
@@ -214,7 +235,53 @@ export default function Home() {
   const loadHistoryResult = (entry: ScanHistoryEntry) => {
     if (entry.results) { setScanResult(entry.results); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   }
-  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null) }
+  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null); setRemediation(null); setRemediationError('') }
+
+  const handleGetRemediation = useCallback(async () => {
+    if (!scanResult) return
+    setIsRemediating(true)
+    setRemediationError('')
+    setRemediation(null)
+    try {
+      const response = await fetch('/api/remediate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scanResult }),
+      })
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({})) as Record<string, string>
+        throw new Error(errData.error || `Remediation failed: ${response.status}`)
+      }
+      const data = await response.json() as RemediationData
+      setRemediation(data)
+      toast({ title: 'AI Remediation Complete', description: 'Plain-English explanations and fix commands are ready' })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Remediation engine failed'
+      setRemediationError(msg)
+      toast({ title: 'Remediation Failed', description: msg, variant: 'destructive' })
+    } finally {
+      setIsRemediating(false)
+    }
+  }, [scanResult])
+
+  const copyToClipboard = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedIdx(id)
+      setTimeout(() => setCopiedIdx(null), 2000)
+    } catch { /* fallback: ignore */ }
+  }
+
+  function riskLevelColor(level: string): string {
+    switch (level.toLowerCase()) {
+      case 'critical': return 'bg-red-500/20 text-red-400 border-red-500/30'
+      case 'high': return 'bg-orange-500/20 text-orange-400 border-orange-500/30'
+      case 'medium': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
+      case 'low': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+      case 'secure': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+      default: return 'bg-muted text-muted-foreground border-border'
+    }
+  }
 
   const scanEngineLabel = scanType === 'nikto' ? 'Nikto' : 'Nmap'
   const scanEngineDesc = scanType === 'nikto'
@@ -231,6 +298,7 @@ export default function Home() {
             <div className="ml-auto flex items-center gap-2">
               <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />Real Data Only</Badge>
               <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">Nmap + Nikto</Badge>
+              <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30"><Sparkles className="h-3 w-3 mr-1" />AI Remediation</Badge>
             </div>
           </div>
         </div>
@@ -491,6 +559,200 @@ export default function Home() {
                   </CardContent>
                 </Card>
               </motion.div>
+
+              {/* ─── AI Auto-Remediation Engine ─────────────────────────────── */}
+              <motion.div custom={8} variants={cardVariants}>
+                <Card className="border-amber-500/30 bg-gradient-to-br from-amber-500/5 via-transparent to-transparent">
+                  <CardHeader>
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                      <div>
+                        <CardTitle className="text-base flex items-center gap-2">
+                          <Sparkles className="h-4 w-4 text-amber-400" />
+                          AI Auto-Remediation Engine
+                        </CardTitle>
+                        <CardDescription className="mt-1">Get plain-English explanations and copy-paste fix commands for every finding</CardDescription>
+                      </div>
+                      {!remediation && !isRemediating && (
+                        <Button onClick={handleGetRemediation} className="bg-amber-600 hover:bg-amber-700 text-white min-w-[200px]">
+                          <Zap className="h-4 w-4 mr-2" />Generate AI Remediation
+                        </Button>
+                      )}
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    {/* Loading state */}
+                    {isRemediating && (
+                      <div className="space-y-4 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="relative">
+                            <Sparkles className="h-5 w-5 text-amber-400 animate-pulse" />
+                          </div>
+                          <div>
+                            <p className="text-sm font-medium">AI is analyzing your findings...</p>
+                            <p className="text-xs text-muted-foreground">Generating plain-English explanations and fix commands</p>
+                          </div>
+                        </div>
+                        <div className="relative h-2 w-full overflow-hidden rounded-full bg-amber-500/10">
+                          <div className="absolute inset-0 h-full w-1/3 rounded-full bg-amber-500 animate-indeterminate" />
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                          {[1,2,3].map(i => (
+                            <div key={i} className="rounded-lg border border-border/30 bg-muted/20 p-4 space-y-2">
+                              <div className="h-4 w-3/4 bg-muted/40 rounded animate-pulse" />
+                              <div className="h-3 w-full bg-muted/30 rounded animate-pulse" />
+                              <div className="h-3 w-5/6 bg-muted/30 rounded animate-pulse" />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Error state */}
+                    {remediationError && !isRemediating && (
+                      <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
+                        <div className="flex items-start gap-3">
+                          <AlertCircle className="h-5 w-5 text-red-400 mt-0.5 shrink-0" />
+                          <div>
+                            <p className="text-sm font-medium text-red-400">Remediation Engine Error</p>
+                            <p className="text-xs text-muted-foreground mt-1">{remediationError}</p>
+                            <Button variant="outline" size="sm" onClick={handleGetRemediation} className="mt-3 text-xs">
+                              <RotateCcw className="h-3 w-3 mr-1" />Retry
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Remediation Results */}
+                    {remediation && !isRemediating && (
+                      <div className="space-y-6">
+                        {/* Summary & Risk Level */}
+                        <div className="flex flex-col sm:flex-row gap-4">
+                          <div className="flex-1 rounded-lg border border-border/50 bg-muted/20 p-4">
+                            <div className="flex items-center gap-2 mb-2">
+                              <AlertTriangle className="h-4 w-4 text-amber-400" />
+                              <span className="text-sm font-semibold">Executive Summary</span>
+                            </div>
+                            <p className="text-sm text-muted-foreground leading-relaxed">{remediation.summary}</p>
+                          </div>
+                          <div className="shrink-0 rounded-lg border border-border/50 bg-muted/20 p-4 flex flex-col items-center justify-center min-w-[140px]">
+                            <span className="text-xs text-muted-foreground mb-1">Risk Level</span>
+                            <Badge variant="outline" className={`text-sm px-3 py-1 ${riskLevelColor(remediation.risk_level)}`}>
+                              {remediation.risk_level}
+                            </Badge>
+                          </div>
+                        </div>
+
+                        {/* Individual Remediations */}
+                        {remediation.remediations.length > 0 && (
+                          <div>
+                            <h4 className="text-sm font-semibold flex items-center gap-2 mb-3">
+                              <Wrench className="h-4 w-4 text-amber-400" />
+                              Remediation Steps ({remediation.remediations.length})
+                            </h4>
+                            <div className="space-y-4 max-h-[600px] overflow-y-auto custom-scrollbar pr-1">
+                              {remediation.remediations.map((item, idx) => (
+                                <motion.div
+                                  key={idx}
+                                  initial={{ opacity: 0, y: 8 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  transition={{ delay: idx * 0.05, duration: 0.3 }}
+                                >
+                                  <div className="rounded-lg border border-border/50 bg-muted/20 p-4 hover:bg-muted/30 transition-colors">
+                                    {/* Finding title + severity */}
+                                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 mb-3">
+                                      <Badge variant="outline" className={severityColor(item.severity)}>{item.severity}</Badge>
+                                      <h5 className="text-sm font-semibold">{item.finding}</h5>
+                                    </div>
+
+                                    {/* Plain English explanation */}
+                                    <div className="mb-3">
+                                      <p className="text-sm text-muted-foreground leading-relaxed">{item.explanation}</p>
+                                    </div>
+
+                                    {/* Fix commands */}
+                                    {item.fix_commands && item.fix_commands.length > 0 && (
+                                      <div className="space-y-2">
+                                        <span className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                                          <Terminal className="h-3.5 w-3.5" />Fix Commands
+                                        </span>
+                                        {item.fix_commands.map((cmd, cmdIdx) => (
+                                          <div key={cmdIdx} className="relative group">
+                                            <pre className="rounded-md bg-zinc-950 border border-zinc-800 p-3 pr-10 text-xs text-emerald-400 font-mono overflow-x-auto whitespace-pre-wrap break-all">
+                                              {cmd}
+                                            </pre>
+                                            <button
+                                              onClick={() => copyToClipboard(cmd, `${idx}-${cmdIdx}`)}
+                                              className="absolute top-2 right-2 p-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
+                                              aria-label="Copy command"
+                                            >
+                                              {copiedIdx === `${idx}-${cmdIdx}` ? (
+                                                <Check className="h-3.5 w-3.5 text-emerald-400" />
+                                              ) : (
+                                                <Copy className="h-3.5 w-3.5" />
+                                              )}
+                                            </button>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+
+                                    {/* References */}
+                                    {item.references && item.references.length > 0 && (
+                                      <div className="mt-3 flex flex-wrap gap-1.5">
+                                        {item.references.slice(0, 3).map((ref, rIdx) => (
+                                          <a key={rIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                            <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                          </a>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </motion.div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Hardening Recommendations */}
+                        {remediation.hardening_recommendations && remediation.hardening_recommendations.length > 0 && (
+                          <div>
+                            <h4 className="text-sm font-semibold flex items-center gap-2 mb-3">
+                              <Shield className="h-4 w-4 text-emerald-400" />
+                              Hardening Recommendations
+                            </h4>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {remediation.hardening_recommendations.map((rec, idx) => (
+                                <div key={idx} className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 flex items-start gap-2">
+                                  <CheckCircle2 className="h-4 w-4 text-emerald-400 mt-0.5 shrink-0" />
+                                  <span className="text-sm text-muted-foreground">{rec}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Raw response fallback */}
+                        {remediation.raw_response && (
+                          <details className="rounded-lg border border-border/30 bg-muted/10">
+                            <summary className="p-3 text-xs text-muted-foreground cursor-pointer hover:text-foreground transition-colors">Raw AI Response</summary>
+                            <div className="p-3 pt-0">
+                              <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-64 overflow-y-auto custom-scrollbar">{remediation.raw_response}</pre>
+                            </div>
+                          </details>
+                        )}
+
+                        {/* Regenerate button */}
+                        <div className="flex justify-center pt-2">
+                          <Button variant="outline" onClick={handleGetRemediation} className="text-xs">
+                            <RotateCcw className="h-3.5 w-3.5 mr-1.5" />Regenerate Remediation
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -545,8 +807,8 @@ export default function Home() {
       <footer className="mt-auto border-t border-border/50 bg-card/50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5"><Shield className="h-3.5 w-3.5 text-primary" />VulnGuard &copy; 2025 — Real Nmap + Nikto Engines</span>
-            <span className="flex items-center gap-1.5"><ExternalLink className="h-3 w-3" />For authorized security testing only — No mock data</span>
+            <span className="flex items-center gap-1.5"><Shield className="h-3.5 w-3.5 text-primary" />VulnGuard &copy; 2025 — Real Nmap + Nikto + AI Remediation</span>
+            <span className="flex items-center gap-1.5"><Sparkles className="h-3 w-3 text-amber-400" />AI-powered explanations and fix commands — For authorized security testing only</span>
           </div>
         </div>
       </footer>

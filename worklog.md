@@ -136,3 +136,45 @@ Stage Summary:
 - Nikto parses CSV output, extracts findings with severity classification, CVE references with links
 - Frontend has engine selector, Nikto-specific results display with severity cards and reference links
 - Both engines tested and working end-to-end through full chain (Caddy → Next.js → API → Scanner → Results)
+---
+Task ID: 11
+Agent: Main Agent
+Task: Implement AI Auto-Remediation Engine - plain-English explanations and step-by-step fix commands
+
+Work Log:
+- Read project state: worklog, API routes, frontend, Prisma schema
+- Invoked LLM skill to understand z-ai-web-dev-sdk chat completions API
+- Created /src/app/api/remediate/route.ts — Backend API endpoint
+  - Uses z-ai-web-dev-sdk (backend only) to call LLM with specialized remediation system prompt
+  - System prompt instructs AI to: explain findings in plain English, provide step-by-step fix commands, prioritize by severity, format as structured JSON
+  - Handles both Nmap and Nikto scan results
+  - Parses LLM response as JSON, with fallback for unparseable responses
+  - Short-circuits for zero findings (returns "Secure" without calling LLM)
+  - Reuses ZAI instance across requests for performance
+- Updated /src/app/page.tsx — Full frontend AI Remediation UI
+  - Added new types: RemediationItem, RemediationData
+  - Added state: remediation, isRemediating, remediationError, copiedIdx
+  - Added handleGetRemediation callback — POSTs scan results to /api/remediate
+  - Added copyToClipboard utility with visual feedback (check mark)
+  - Added riskLevelColor helper function
+  - Added "AI Remediation" badge in header
+  - Added complete remediation card with:
+    - "Generate AI Remediation" button (amber-themed)
+    - Loading state with animated skeleton cards
+    - Error state with retry button
+    - Executive summary + risk level badge
+    - Individual remediation cards (severity, explanation, fix commands with copy buttons, references)
+    - Hardening recommendations grid
+    - Raw AI response fallback (collapsible details)
+    - Regenerate button
+  - Updated footer with AI mention
+- Tested remediation API with curl — real nmap scan results → LLM generates 4 remediations with fix commands
+- All lint checks pass
+
+Stage Summary:
+- AI Auto-Remediation Engine fully implemented and tested end-to-end
+- Backend: POST /api/remediate accepts scan results → z-ai-web-dev-sdk LLM → structured JSON remediation
+- Frontend: "Generate AI Remediation" button → loading → results display with copy-paste fix commands
+- JSON contract: {summary, risk_level, remediations: [{finding, severity, explanation, fix_commands, references}], hardening_recommendations}
+- LLM response time: ~26 seconds for a typical scan with 2 services
+- Real data only — no mocks, AI generates context-specific remediation based on actual scan findings
