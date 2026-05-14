@@ -34,6 +34,7 @@ model Post {
 model Scan {
   id        String   @id @default(uuid())
   target    String
+  scanType  String   @default("nmap")
   status    String   @default("Pending")
   results   String?
   createdAt DateTime @default(now())
