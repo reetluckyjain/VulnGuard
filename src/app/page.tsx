@@ -34,7 +34,33 @@ interface NiktoScanResult {
   summary: { total: number; info: number; low: number; medium: number; high: number }
 }
 
-type ScanResult = NmapScanResult | NiktoScanResult
+interface NucleiFinding {
+  templateId: string
+  name: string
+  severity: string  // critical, high, medium, low, info
+  type: string      // http, dns, etc.
+  matchedAt: string // The exact vulnerable URL
+  curlCommand: string | null  // Reproduction command - gold mine for bug hunters
+  extractedResults: string[]  // Extracted data (API keys, DB versions)
+  description: string
+  tags: string[]
+  reference: string[]
+  host: string
+  timestamp: string
+}
+
+interface NucleiScanResult {
+  target: string
+  scanType: 'nuclei'
+  findings: NucleiFinding[]
+  vulnerabilities: Vulnerability[]
+  summary: {
+    total: number; critical: number; high: number; medium: number
+    low: number; info: number; withCurlCommand: number; withExtractedResults: number
+  }
+}
+
+type ScanResult = NmapScanResult | NiktoScanResult | NucleiScanResult
 
 interface RemediationItem {
   finding: string
@@ -53,7 +79,7 @@ interface RemediationData {
 }
 
 interface ScanHistoryEntry {
-  id: string; target: string; scanType: 'nmap' | 'nikto'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
+  id: string; target: string; scanType: 'nmap' | 'nikto' | 'nuclei'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
 }
 
 interface VerificationData {
@@ -83,6 +109,10 @@ function isNiktoResult(result: ScanResult | null): result is NiktoScanResult {
   return !!result && typeof result === 'object' && 'scanType' in result && result.scanType === 'nikto'
 }
 
+function isNucleiResult(result: ScanResult | null): result is NucleiScanResult {
+  return !!result && typeof result === 'object' && 'scanType' in result && result.scanType === 'nuclei'
+}
+
 function stateColor(state: string): string {
   switch (state.toLowerCase()) {
     case 'open': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
@@ -94,6 +124,7 @@ function stateColor(state: string): string {
 
 function severityColor(severity: string): string {
   switch (severity.toLowerCase()) {
+    case 'critical': return 'bg-red-600/20 text-red-500 border-red-600/30'
     case 'high': return 'bg-red-500/20 text-red-400 border-red-500/30'
     case 'medium': return 'bg-orange-500/20 text-orange-400 border-orange-500/30'
     case 'low': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
@@ -120,13 +151,13 @@ function normalizeStatus(status: string): ScanHistoryEntry['status'] {
 
 export default function Home() {
   const [target, setTarget] = useState('')
-  const [scanType, setScanType] = useState<'nmap' | 'nikto'>('nmap')
+  const [scanType, setScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
   const [niktoPort, setNiktoPort] = useState('80')
   const [isAuthorized, setIsAuthorized] = useState(false)
   const [validationError, setValidationError] = useState('')
   const [isScanning, setIsScanning] = useState(false)
   const [currentScanTarget, setCurrentScanTarget] = useState('')
-  const [currentScanType, setCurrentScanType] = useState<'nmap' | 'nikto'>('nmap')
+  const [currentScanType, setCurrentScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([])
   const [activeScanId, setActiveScanId] = useState<string | null>(null)
@@ -146,14 +177,14 @@ export default function Home() {
   // Scheduling state
   const [schedules, setSchedules] = useState<ScheduleEntry[]>([])
   const [scheduleTarget, setScheduleTarget] = useState('')
-  const [scheduleScanType, setScheduleScanType] = useState<'nmap' | 'nikto'>('nmap')
+  const [scheduleScanType, setScheduleScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
   const [scheduleFrequency, setScheduleFrequency] = useState('daily')
   const [isCreatingSchedule, setIsCreatingSchedule] = useState(false)
 
   const isIPAddress = (t: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t)
 
   // Nmap stats
-  const nmapResult = scanResult && !isNiktoResult(scanResult) ? scanResult as NmapScanResult : null
+  const nmapResult = scanResult && !isNiktoResult(scanResult) && !isNucleiResult(scanResult) ? scanResult as NmapScanResult : null
   const openPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'open').length ?? 0
   const closedPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'closed').length ?? 0
   const filteredPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'filtered').length ?? 0
@@ -166,7 +197,13 @@ export default function Home() {
   const niktoVulnCount = niktoResult?.vulnerabilities?.length ?? 0
   const niktoSummary = niktoResult?.summary ?? { total: 0, info: 0, low: 0, medium: 0, high: 0 }
 
-  const vulnCount = isNiktoResult(scanResult) ? niktoVulnCount : nmapVulnCount
+  // Nuclei stats
+  const nucleiResult = scanResult && isNucleiResult(scanResult) ? scanResult : null
+  const nucleiFindingsCount = nucleiResult?.findings?.length ?? 0
+  const nucleiVulnCount = nucleiResult?.vulnerabilities?.length ?? 0
+  const nucleiSummary = nucleiResult?.summary ?? { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 }
+
+  const vulnCount = isNucleiResult(scanResult) ? nucleiVulnCount : isNiktoResult(scanResult) ? niktoVulnCount : nmapVulnCount
 
   const handleStartScan = useCallback(async () => {
     if (!target.trim()) { setValidationError('Please enter a target IP or hostname'); return }
@@ -185,7 +222,7 @@ export default function Home() {
     setCurrentScanTarget(target.trim())
     setCurrentScanType(scanType)
     setScanResult(null)
-    setScanStatusText(scanType === 'nikto' ? 'Running real Nikto web scan...' : 'Running real nmap scan...')
+    setScanStatusText(scanType === 'nikto' ? 'Running real Nikto web scan...' : scanType === 'nuclei' ? 'Running real Nuclei bug hunt...' : 'Running real nmap scan...')
     const scanId = `scan-${Date.now()}`
     const historyEntry: ScanHistoryEntry = { id: scanId, target: target.trim(), scanType, status: 'running', timestamp: new Date().toISOString() }
     setScanHistory(prev => [historyEntry, ...prev])
@@ -202,7 +239,7 @@ export default function Home() {
               target: target.trim(),
               isAuthorized: true,
               scanType,
-              port: scanType === 'nikto' ? niktoPort : undefined,
+              port: (scanType === 'nikto' || scanType === 'nuclei') ? niktoPort : undefined,
             }),
           })
           if (response.ok) break
@@ -228,7 +265,7 @@ export default function Home() {
         setScanResult(data.results as ScanResult)
         setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null)
         setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId, status: (returnedStatus || 'completed') as ScanHistoryEntry['status'], results: data.results as ScanResult } : e))
-        const engine = scanType === 'nikto' ? 'Nikto' : 'nmap'
+        const engine = scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
         toast({ title: 'Scan Complete', description: `${engine} scan of ${target.trim()} completed` })
       } else if (returnedStatus === 'failed') {
         setIsScanning(false); setCurrentScanTarget('')
@@ -341,7 +378,7 @@ export default function Home() {
       const response = await fetch('/api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: scheduleTarget.trim(), scanType: scheduleScanType, port: scheduleScanType === 'nikto' ? '80' : undefined, frequency: scheduleFrequency }),
+        body: JSON.stringify({ target: scheduleTarget.trim(), scanType: scheduleScanType, port: (scheduleScanType === 'nikto' || scheduleScanType === 'nuclei') ? '80' : undefined, frequency: scheduleFrequency }),
       })
       if (!response.ok) {
         const err = await response.json().catch(() => ({})) as Record<string, string>
@@ -431,9 +468,11 @@ export default function Home() {
     }
   }
 
-  const scanEngineLabel = scanType === 'nikto' ? 'Nikto' : 'Nmap'
+  const scanEngineLabel = scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
   const scanEngineDesc = scanType === 'nikto'
     ? 'nikto -h target -Format csv — Web vulnerability scanner'
+    : scanType === 'nuclei'
+    ? 'nuclei -u target -jsonl — Template-based bug hunter'
     : 'nmap -sT -sV --script vuln — Network/port scanner'
 
   return (
@@ -445,7 +484,7 @@ export default function Home() {
             <div><h1 className="text-xl font-bold tracking-tight text-foreground">VulnGuard</h1><p className="text-xs text-muted-foreground">Ethical Vulnerability Scanner — Real Engines</p></div>
             <div className="ml-auto flex items-center gap-2">
               <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />Real Data Only</Badge>
-              <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">Nmap + Nikto</Badge>
+              <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">Nmap + Nikto + Nuclei</Badge>
               <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30"><Sparkles className="h-3 w-3 mr-1" />AI Remediation</Badge>
               <Badge variant="outline" className="text-xs bg-cyan-500/10 text-cyan-400 border-cyan-500/30"><Fingerprint className="h-3 w-3 mr-1" />DNS Verify</Badge>
             </div>
@@ -474,15 +513,15 @@ export default function Home() {
         {/* Scan Config */}
         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: 0.1 }}>
           <Card>
-            <CardHeader><CardTitle className="text-base">Start New Scan</CardTitle><CardDescription>Choose a scan engine and enter a target. Both engines run real scans — no simulation.</CardDescription></CardHeader>
+            <CardHeader><CardTitle className="text-base">Start New Scan</CardTitle><CardDescription>Choose a scan engine and enter a target. All engines run real scans — no simulation.</CardDescription></CardHeader>
             <CardContent>
               <div className="flex flex-col gap-4">
                 {/* Engine selector row */}
                 <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
                   <div className="flex items-center gap-2 shrink-0">
                     <span className="text-sm font-medium text-muted-foreground">Engine:</span>
-                    <Select value={scanType} onValueChange={(v) => setScanType(v as 'nmap' | 'nikto')}>
-                      <SelectTrigger className="w-[150px]"><SelectValue /></SelectTrigger>
+                    <Select value={scanType} onValueChange={(v) => setScanType(v as 'nmap' | 'nikto' | 'nuclei')}>
+                      <SelectTrigger className="w-[180px]"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="nmap">
                           <span className="flex items-center gap-2"><Server className="h-3.5 w-3.5" />Nmap</span>
@@ -490,10 +529,13 @@ export default function Home() {
                         <SelectItem value="nikto">
                           <span className="flex items-center gap-2"><Globe className="h-3.5 w-3.5" />Nikto</span>
                         </SelectItem>
+                        <SelectItem value="nuclei">
+                          <span className="flex items-center gap-2"><Bug className="h-3.5 w-3.5" />Nuclei</span>
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
-                  {scanType === 'nikto' && (
+                  {(scanType === 'nikto' || scanType === 'nuclei') && (
                     <div className="flex items-center gap-2">
                       <span className="text-sm text-muted-foreground shrink-0">Port:</span>
                       <Input type="text" value={niktoPort} onChange={e => setNiktoPort(e.target.value)} className="w-20 font-mono" placeholder="80" aria-label="Nikto target port" />
@@ -531,6 +573,8 @@ export default function Home() {
                   <Info className="h-3.5 w-3.5 shrink-0" />
                   {scanType === 'nikto' ? (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nikto -h target -Format csv -C all</code> — Web vulnerability scanner, 100% real data.</span>
+                  ) : scanType === 'nuclei' ? (
+                    <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nuclei -u target -jle results.jsonl</code> — Template-based bug hunter (XSS, SQLi, secrets, CVEs), 100% real data.</span>
                   ) : (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — Network/port scanner, 100% real data.</span>
                   )}
@@ -608,11 +652,12 @@ export default function Home() {
                 </div>
                 <div className="w-[130px]">
                   <label className="text-xs text-muted-foreground mb-1 block">Engine</label>
-                  <Select value={scheduleScanType} onValueChange={v => setScheduleScanType(v as 'nmap' | 'nikto')}>
+                  <Select value={scheduleScanType} onValueChange={v => setScheduleScanType(v as 'nmap' | 'nikto' | 'nuclei')}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="nmap">Nmap</SelectItem>
                       <SelectItem value="nikto">Nikto</SelectItem>
+                      <SelectItem value="nuclei">Nuclei</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -688,6 +733,8 @@ export default function Home() {
                     <p className="text-xs text-muted-foreground/60">
                       {currentScanType === 'nikto'
                         ? 'Running real Nikto web scan — this may take 1-2 minutes.'
+                        : currentScanType === 'nuclei'
+                        ? 'Running real Nuclei bug hunt — this may take 2-5 minutes.'
                         : 'Running real nmap scan — this may take 1-3 minutes.'}
                     </p>
                   </div>
@@ -831,6 +878,130 @@ export default function Home() {
                 </>
               )}
 
+              {/* ─── Nuclei Bug Hunt Results ──────────────────────────────────────── */}
+              {nucleiResult && nucleiResult.findings.length > 0 && (
+                <motion.div variants={staggerContainer} initial="hidden" animate="visible" className="space-y-4">
+                  {/* Nuclei Summary Stats */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                    {[
+                      { label: 'Critical', value: nucleiSummary.critical, color: 'text-red-500' },
+                      { label: 'High', value: nucleiSummary.high, color: 'text-red-400' },
+                      { label: 'Medium', value: nucleiSummary.medium, color: 'text-orange-400' },
+                      { label: 'Low', value: nucleiSummary.low, color: 'text-yellow-400' },
+                      { label: 'Info', value: nucleiSummary.info, color: 'text-blue-400' },
+                      { label: 'Total', value: nucleiSummary.total, color: 'text-foreground' },
+                      { label: 'With curl', value: nucleiSummary.withCurlCommand, color: 'text-emerald-400' },
+                      { label: 'Extracted', value: nucleiSummary.withExtractedResults, color: 'text-cyan-400' },
+                    ].map(stat => (
+                      <motion.div key={stat.label} variants={staggerItem}>
+                        <Card className="border-border/50">
+                          <CardContent className="p-3 text-center">
+                            <div className={`text-2xl font-bold ${stat.color}`}>{stat.value}</div>
+                            <div className="text-xs text-muted-foreground">{stat.label}</div>
+                          </CardContent>
+                        </Card>
+                      </motion.div>
+                    ))}
+                  </div>
+
+                  {/* Nuclei Findings List — grouped by severity */}
+                  {['critical', 'high', 'medium', 'low', 'info'].map(sev => {
+                    const sevFindings = nucleiResult.findings.filter(f => f.severity === sev)
+                    if (sevFindings.length === 0) return null
+                    return (
+                      <div key={sev} className="space-y-3">
+                        <h3 className="text-sm font-semibold flex items-center gap-2">
+                          <Badge variant="outline" className={severityColor(sev)}>{sev.toUpperCase()}</Badge>
+                          <span className="text-muted-foreground">{sevFindings.length} finding{sevFindings.length !== 1 ? 's' : ''}</span>
+                        </h3>
+                        <div className="space-y-2 max-h-[600px] overflow-y-auto">
+                          {sevFindings.map((finding, idx) => (
+                            <motion.div key={`${finding.templateId}-${idx}`} variants={staggerItem}>
+                              <Card className="border-border/50 hover:border-border transition-colors">
+                                <CardContent className="p-4 space-y-3">
+                                  {/* Finding Header */}
+                                  <div className="flex flex-col sm:flex-row sm:items-start gap-2">
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <Badge variant="outline" className={severityColor(finding.severity)}>{finding.severity.toUpperCase()}</Badge>
+                                        <Badge variant="outline" className="text-xs bg-muted/50">{finding.type.toUpperCase()}</Badge>
+                                        <span className="font-semibold text-sm">{finding.name}</span>
+                                      </div>
+                                      <p className="text-xs text-muted-foreground font-mono mt-1">{finding.templateId}</p>
+                                    </div>
+                                  </div>
+
+                                  {/* Matched At */}
+                                  {finding.matchedAt && (
+                                    <div className="flex items-start gap-2">
+                                      <ExternalLink className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
+                                      <p className="text-sm font-mono text-primary break-all">{finding.matchedAt}</p>
+                                    </div>
+                                  )}
+
+                                  {/* Curl Reproduction Command */}
+                                  {finding.curlCommand && (
+                                    <div className="rounded-md bg-zinc-950 border border-zinc-800 p-3 relative group">
+                                      <div className="flex items-center gap-1.5 mb-1.5">
+                                        <Terminal className="h-3.5 w-3.5 text-emerald-400" />
+                                        <span className="text-xs text-emerald-400 font-semibold">Reproduce with curl</span>
+                                      </div>
+                                      <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap break-all">{finding.curlCommand}</pre>
+                                      <button
+                                        onClick={() => copyToClipboard(finding.curlCommand!, `nuclei-curl-${idx}`)}
+                                        className="absolute top-2 right-2 p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100"
+                                        aria-label="Copy curl command"
+                                      >
+                                        {copiedIdx === `nuclei-curl-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                                      </button>
+                                    </div>
+                                  )}
+
+                                  {/* Extracted Results */}
+                                  {finding.extractedResults.length > 0 && (
+                                    <div className="space-y-1.5">
+                                      <div className="flex items-center gap-1.5">
+                                        <Zap className="h-3.5 w-3.5 text-amber-400" />
+                                        <span className="text-xs text-amber-400 font-semibold">Extracted Data</span>
+                                      </div>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        {finding.extractedResults.map((er, erIdx) => (
+                                          <span key={erIdx} className="inline-block text-xs font-mono bg-amber-500/10 text-amber-300 border border-amber-500/30 rounded px-2 py-0.5 break-all max-w-full">{er}</span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Tags */}
+                                  {finding.tags.length > 0 && (
+                                    <div className="flex flex-wrap gap-1">
+                                      {finding.tags.map((tag, tagIdx) => (
+                                        <Badge key={tagIdx} variant="outline" className="text-xs bg-muted/30">{tag}</Badge>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  {/* References */}
+                                  {finding.reference.length > 0 && (
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {finding.reference.slice(0, 3).map((ref, refIdx) => (
+                                        <a key={refIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                          <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                        </a>
+                                      ))}
+                                    </div>
+                                  )}
+                                </CardContent>
+                              </Card>
+                            </motion.div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </motion.div>
+              )}
+
               {/* Scan Info Card */}
               <motion.div custom={7} variants={cardVariants}>
                 <Card>
@@ -838,11 +1009,11 @@ export default function Home() {
                   <CardContent>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                       <div><span className="text-muted-foreground">Target:</span> <span className="font-mono">{scanResult?.target || 'N/A'}</span></div>
-                      <div><span className="text-muted-foreground">Engine:</span> <span className="font-mono">{isNiktoResult(scanResult) ? 'Nikto (Web Scanner)' : 'Nmap (Network Scanner)'}</span></div>
+                      <div><span className="text-muted-foreground">Engine:</span> <span className="font-mono">{isNucleiResult(scanResult) ? 'Nuclei (Bug Hunter)' : isNiktoResult(scanResult) ? 'Nikto (Web Scanner)' : 'Nmap (Network Scanner)'}</span></div>
                       {isNiktoResult(scanResult) && niktoResult?.server && niktoResult.server !== 'Unknown' && (
                         <div><span className="text-muted-foreground">Server:</span> <span className="font-mono">{niktoResult.server}</span></div>
                       )}
-                      {!isNiktoResult(scanResult) && (
+                      {!isNiktoResult(scanResult) && !isNucleiResult(scanResult) && (
                         <>
                           <div><span className="text-muted-foreground">Ports Found:</span> <span className="font-mono">{nmapResult?.ports?.length ?? 0}</span></div>
                           <div><span className="text-muted-foreground">Open Ports:</span> <span className="font-mono text-emerald-400">{openPortCount}</span></div>
@@ -1101,7 +1272,7 @@ export default function Home() {
       <footer className="mt-auto border-t border-border/50 bg-card/50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5"><Shield className="h-3.5 w-3.5 text-primary" />VulnGuard &copy; 2025 — Real Nmap + Nikto + AI Remediation</span>
+            <span className="flex items-center gap-1.5"><Shield className="h-3.5 w-3.5 text-primary" />VulnGuard &copy; 2025 — Real Nmap + Nikto + Nuclei + AI Remediation</span>
             <span className="flex items-center gap-1.5"><Sparkles className="h-3 w-3 text-amber-400" />AI-powered explanations and fix commands — For authorized security testing only</span>
           </div>
         </div>

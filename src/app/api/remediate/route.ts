@@ -4,7 +4,7 @@ import ZAI from "z-ai-web-dev-sdk";
 /**
  * POST /api/remediate — AI Auto-Remediation Engine
  *
- * Takes raw scan findings (nmap or nikto) and generates:
+ * Takes raw scan findings (nmap, nikto, or nuclei) and generates:
  *   - Plain-English explanations of each vulnerability/finding
  *   - Step-by-step fix commands for remediation
  *
@@ -32,10 +32,30 @@ interface NiktoScanResult {
   summary: { total: number; info: number; low: number; medium: number; high: number }
 }
 
-type ScanResult = NmapScanResult | NiktoScanResult
+interface NucleiFinding {
+  templateId: string; name: string; severity: string; type: string
+  matchedAt: string; curlCommand: string | null; extractedResults: string[]
+  description: string; tags: string[]; reference: string[]
+  host: string; timestamp: string
+}
+
+interface NucleiScanResult {
+  target: string; scanType: "nuclei"
+  findings: NucleiFinding[]; vulnerabilities: Vulnerability[]
+  summary: {
+    total: number; critical: number; high: number; medium: number
+    low: number; info: number; withCurlCommand: number; withExtractedResults: number
+  }
+}
+
+type ScanResult = NmapScanResult | NiktoScanResult | NucleiScanResult
 
 function isNiktoResult(result: ScanResult): result is NiktoScanResult {
   return "scanType" in result && result.scanType === "nikto"
+}
+
+function isNucleiResult(result: ScanResult): result is NucleiScanResult {
+  return "scanType" in result && result.scanType === "nuclei"
 }
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
@@ -48,9 +68,11 @@ RULES:
 3. Prioritize by severity: Critical → High → Medium → Low → Info.
 4. If a CVE is mentioned, briefly explain what the CVE is about and its CVSS impact if known.
 5. For service/version findings, recommend the specific upgrade path or configuration change.
-6. For web findings (Nikto), provide .htaccess, nginx config, or application-level fixes.
-7. Always include the EXACT commands — no placeholders like "YOUR_IP" without showing the actual value from the findings.
-8. Format your response as valid JSON with this exact structure:
+6. For web findings (Nikto/Nuclei), provide .htaccess, nginx config, or application-level fixes.
+7. For Nuclei findings with curl-command reproduction, analyze the exact request and suggest WAF rules or code fixes.
+8. For exposed secrets/API keys found by Nuclei, recommend immediate rotation and revocation steps.
+9. Always include the EXACT commands — no placeholders like "YOUR_IP" without showing the actual value from the findings.
+10. Format your response as valid JSON with this exact structure:
 
 {
   "summary": "2-3 sentence executive summary of the security posture",
@@ -72,7 +94,35 @@ RESPOND WITH VALID JSON ONLY. No markdown fences, no extra text.`
 // ─── Build LLM Prompt from Findings ─────────────────────────────────────────
 
 function buildRemediationPrompt(result: ScanResult): string {
-  if (isNiktoResult(result)) {
+  if (isNucleiResult(result)) {
+    const findingsText = result.findings.map((f, i) => {
+      let line = `[${i + 1}] [${f.severity.toUpperCase()}] ${f.name}`;
+      if (f.matchedAt) line += `\n    Matched at: ${f.matchedAt}`;
+      if (f.curlCommand) line += `\n    Reproduce: ${f.curlCommand}`;
+      if (f.extractedResults.length > 0) line += `\n    Extracted: ${f.extractedResults.join(", ")}`;
+      if (f.tags.length > 0) line += `\n    Tags: ${f.tags.join(", ")}`;
+      if (f.reference.length > 0) line += `\n    Refs: ${f.reference.join(", ")}`;
+      line += `\n    Template: ${f.templateId}`;
+      return line;
+    }).join("\n\n")
+
+    const vulnsText = result.vulnerabilities.map(v =>
+      `- ${v.cve_id}: ${v.description}`
+    ).join("\n")
+
+    return `Analyze these Nuclei vulnerability scan results for target "${result.target}":
+
+FINDINGS (${result.findings.length} total — ${result.summary.critical} Critical, ${result.summary.high} High, ${result.summary.medium} Medium, ${result.summary.low} Low, ${result.summary.info} Info):
+${findingsText || "No findings"}
+
+CVEs (${result.vulnerabilities.length}):
+${vulnsText || "No CVEs detected"}
+
+${result.summary.withCurlCommand > 0 ? `${result.summary.withCurlCommand} findings have curl reproduction commands.` : ""}
+${result.summary.withExtractedResults > 0 ? `${result.summary.withExtractedResults} findings have extracted data (secrets/keys/versions).` : ""}
+
+Generate remediation guidance. For findings with curl commands, analyze the exact HTTP request and suggest code-level or WAF-level fixes. For exposed secrets, recommend immediate rotation.`
+  } else if (isNiktoResult(result)) {
     const findingsText = result.findings.map((f, i) =>
       `[${i + 1}] ${f.description} (Port: ${f.port}, Method: ${f.method}, Path: ${f.path}${f.references.length ? ", Refs: " + f.references.join(", ") : ""})`
     ).join("\n")
@@ -136,10 +186,14 @@ export async function POST(request: NextRequest) {
 
     // Quick check: if there are zero findings and zero vulns and zero ports,
     // no need to call the LLM
-    const hasNikto = isNiktoResult(rawResult)
-    const totalFindings = hasNikto
-      ? (rawResult as NiktoScanResult).findings.length + (rawResult as NiktoScanResult).vulnerabilities.length
-      : (rawResult as NmapScanResult).ports.length + (rawResult as NmapScanResult).vulnerabilities.length
+    let totalFindings = 0
+    if (isNucleiResult(rawResult)) {
+      totalFindings = rawResult.findings.length + rawResult.vulnerabilities.length
+    } else if (isNiktoResult(rawResult)) {
+      totalFindings = rawResult.findings.length + rawResult.vulnerabilities.length
+    } else {
+      totalFindings = rawResult.ports.length + rawResult.vulnerabilities.length
+    }
 
     if (totalFindings === 0) {
       return NextResponse.json({

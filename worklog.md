@@ -1,20 +1,27 @@
 ---
 Task ID: 1
 Agent: Main Agent
-Task: Fix preview availability and verify all features working
+Task: Integrate Nuclei as third scanning engine into VulnGuard
 
 Work Log:
-- Diagnosed that the Next.js dev server was not binding to 0.0.0.0, causing Caddy to return 502
-- Updated package.json dev script to use `-H 0.0.0.0` flag
-- Updated start-dev.sh and run-dev.sh to use `-H 0.0.0.0`
-- Removed `| tee dev.log` from dev script to prevent SIGPIPE kills
-- Added `allowedDevOrigins` to next.config.ts for preview panel compatibility
-- Verified all API endpoints work: /api/schedules, /api/verify, /api/scans
-- Verified scheduler mini-service runs on port 3004
-- Created .zscripts/dev.sh for custom dev startup with keepalive loop
+- Installed Nuclei v3.3.7 binary from GitHub releases to /home/z/.local/bin/nuclei
+- Updated nuclei templates to /home/z/nuclei-templates/
+- Created run-nuclei-scan.sh shell wrapper with JSONL output format (-jle flag)
+- Script targets CVEs, vulnerabilities, exposures, misconfigurations, default-logins, and takeovers templates
+- Added NucleiFinding and NucleiScanResult TypeScript interfaces to backend
+- Created parseNucleiJsonl() parser that extracts: template-id, name, severity, type, matched-at, curl-command, extracted-results, tags, references
+- Updated POST /api/scan to accept "nuclei" as scanType with resolveScanType helper
+- Updated processScanResults() to handle nuclei JSONL files
+- Updated GET /api/scan/[id] — already generic, handles nuclei through processScanResults
+- Updated /api/remediate to handle Nuclei findings with specialized prompts for curl commands and extracted secrets
+- Updated frontend with Nuclei types, engine selector, port input, info text
+- Added comprehensive Nuclei results UI with severity grouping, curl reproduction blocks, extracted data pills
+- Updated header badges, footer, schedule dropdown
+- All lint checks pass, dev server running on port 3000
 
 Stage Summary:
-- Key fix: `-H 0.0.0.0` binding makes server accessible through Caddy proxy
-- All features working: DNS TXT verification, scheduled scans, AI remediation, nmap/nikto scanning
-- Server process management: sandbox kills background processes between bash sessions; use .zscripts/dev.sh for persistent startup
-- Scheduler service on port 3004 is operational with health check endpoint
+- Nuclei v3.3.7 fully integrated as third engine alongside Nmap and Nikto
+- Real data only — nuclei binary executes actual template-based scans
+- JSONL parser handles all key fields including curl-command and extracted-results
+- Frontend displays findings grouped by severity with copy-able curl reproduction commands
+- Modular plugin architecture proven: adding a new engine required changes to 4 files (scan script, API route, remediate route, page.tsx)

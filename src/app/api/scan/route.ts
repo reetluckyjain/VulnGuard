@@ -8,9 +8,10 @@ import { join, resolve } from "path";
 /**
  * POST /api/scan — Create and execute a new scan
  *
- * Supports two scan types:
+ * Supports three scan types:
  *   - nmap: Port scanning + service version detection + vuln scripts
  *   - nikto: Web vulnerability scanning (HTTP-level checks)
+ *   - nuclei: Template-based bug hunting (XSS, SQLi, secrets, CVEs)
  *
  * Spawns the scanner via a standalone shell script that runs completely independently.
  * The script writes output to temp files, which are read by the GET route.
@@ -34,13 +35,13 @@ function isIPAddress(target: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(target);
 }
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ─── Nmap Types ──────────────────────────────────────────────────────────────
 
 interface PortInfo { port_id: number; protocol: string; state: string; service: string; version: string }
 interface Vulnerability { port_id: number; cve_id: string; description: string }
-interface ScanResult { target: string; ports: PortInfo[]; vulnerabilities: Vulnerability[] }
+interface NmapScanResult { target: string; ports: PortInfo[]; vulnerabilities: Vulnerability[] }
 
-// ─── Nikto-specific types ───────────────────────────────────────────────────
+// ─── Nikto Types ─────────────────────────────────────────────────────────────
 
 interface NiktoFinding {
   id: string;
@@ -62,9 +63,45 @@ interface NiktoScanResult {
   summary: { total: number; info: number; low: number; medium: number; high: number };
 }
 
+// ─── Nuclei Types ────────────────────────────────────────────────────────────
+
+interface NucleiFinding {
+  templateId: string;
+  name: string;
+  severity: string;
+  type: string;
+  matchedAt: string;
+  curlCommand: string | null;
+  extractedResults: string[];
+  description: string;
+  tags: string[];
+  reference: string[];
+  host: string;
+  timestamp: string;
+}
+
+interface NucleiScanResult {
+  target: string;
+  scanType: "nuclei";
+  findings: NucleiFinding[];
+  vulnerabilities: Vulnerability[];
+  summary: {
+    total: number;
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+    info: number;
+    withCurlCommand: number;
+    withExtractedResults: number;
+  };
+}
+
 // ─── Shared ─────────────────────────────────────────────────────────────────
 
 const CVE_REGEX = /CVE-\d{4}-\d{4,7}/g;
+
+type ScanResultType = NmapScanResult | NiktoScanResult | NucleiScanResult;
 
 // ─── Nmap XML Parsing ───────────────────────────────────────────────────────
 
@@ -79,7 +116,7 @@ function extractCveDescription(cveId: string, text: string, scriptId: string, po
   return `${cveId} detected by nmap ${scriptId} script on port ${port}/${proto}`;
 }
 
-function parseNmapXml(target: string, xml: string): ScanResult {
+function parseNmapXml(target: string, xml: string): NmapScanResult {
   const ports: PortInfo[] = [];
   const vulnerabilities: Vulnerability[] = [];
 
@@ -152,7 +189,6 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
   const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
 
   for (const line of lines) {
-    // Parse quoted CSV: "field1","field2",...
     const fields: string[] = [];
     let current = "";
     let inQuotes = false;
@@ -174,14 +210,11 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
     }
     fields.push(current);
 
-    // Header line: "Nikto - v2.6.0/"
     if (fields.length <= 1 && fields[0]?.startsWith("Nikto")) continue;
 
-    // Data line: hostname, ip, port, references, method, path, description
     if (fields.length >= 7) {
       const [host, ip, portStr, references, method, path, description] = fields;
 
-      // Detect server header from description
       if (description?.includes("appears to be outdated") || description?.includes("Server:")) {
         const serverMatch = description.match(/(?:Server:\s*|^)([A-Za-z][^\s.]+)/);
         if (serverMatch) server = serverMatch[1];
@@ -201,7 +234,6 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
       };
       findings.push(finding);
 
-      // Extract CVEs from references and description
       CVE_REGEX.lastIndex = 0;
       const allText = `${references} ${description}`;
       const cveMatches = allText.match(CVE_REGEX);
@@ -226,7 +258,6 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
     }
   }
 
-  // Compute summary
   const summary = {
     total: findings.length,
     info: findings.filter(f =>
@@ -254,6 +285,130 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
   return { target, scanType: "nikto", server, findings, vulnerabilities, summary };
 }
 
+// ─── Nuclei JSONL Parsing ───────────────────────────────────────────────────
+//
+// Nuclei outputs one JSON object per line. Each line represents a finding.
+// Key fields we extract:
+//   - template-id: The specific check that fired (e.g. "http/cves/CVE-2021-44228")
+//   - info.name: Human-readable vulnerability name
+//   - info.severity: critical, high, medium, low, info
+//   - type: Protocol type (http, dns, etc.)
+//   - matched-at: The exact URL that is vulnerable
+//   - curl-command: Reproduction command (HIGHLY valuable for bug bounty hunters)
+//   - extracted-results: Data nuclei extracted (API keys, DB versions, etc.)
+//   - info.tags: Template tags for categorization
+//   - info.reference: Reference URLs
+//   - host: The target host
+//   - timestamp: When the finding was discovered
+
+function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
+  const findings: NucleiFinding[] = [];
+  const vulnerabilities: Vulnerability[] = [];
+  const lines = jsonl.split("\n").filter(l => l.trim().length > 0);
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+
+      // Extract nested info object
+      const info = (obj.info as Record<string, unknown>) || {};
+
+      // Core fields
+      const templateId = (obj["template-id"] as string) || (obj.templateID as string) || "";
+      const name = (info.name as string) || templateId || "Unknown Finding";
+      const severity = normalizeSeverity((info.severity as string) || "info");
+      const type = (obj.type as string) || "http";
+      const matchedAt = (obj["matched-at"] as string) || (obj.matched as string) || "";
+      const host = (obj.host as string) || target;
+      const timestamp = (obj.timestamp as string) || new Date().toISOString();
+
+      // curl-command — the gold mine for bug bounty hunters
+      const curlCommand = (obj["curl-command"] as string) || null;
+
+      // Extracted results (API keys, DB versions, paths, etc.)
+      const extractedResults = Array.isArray(obj["extracted-results"])
+        ? (obj["extracted-results"] as string[])
+        : [];
+
+      // Tags and references
+      const tags = Array.isArray(info.tags)
+        ? (info.tags as string[]).map(String)
+        : typeof info.tags === "string"
+          ? info.tags.split(",").map(t => t.trim()).filter(Boolean)
+          : [];
+      const reference = Array.isArray(info.reference)
+        ? (info.reference as string[]).map(String)
+        : [];
+
+      // Build description from name + extracted results
+      let description = name;
+      if (extractedResults.length > 0) {
+        description += ` — Extracted: ${extractedResults.join(", ")}`;
+      }
+      if (matchedAt) {
+        description += ` at ${matchedAt}`;
+      }
+
+      findings.push({
+        templateId,
+        name,
+        severity,
+        type,
+        matchedAt,
+        curlCommand,
+        extractedResults,
+        description,
+        tags,
+        reference,
+        host,
+        timestamp,
+      });
+
+      // Extract CVEs from template ID and tags
+      const cveText = `${templateId} ${tags.join(" ")} ${name}`;
+      CVE_REGEX.lastIndex = 0;
+      const cveMatches = cveText.match(CVE_REGEX);
+      if (cveMatches) {
+        const seen = new Set<string>();
+        for (const cveId of cveMatches) {
+          if (!seen.has(cveId)) {
+            seen.add(cveId);
+            vulnerabilities.push({
+              port_id: 0,
+              cve_id: cveId,
+              description: `${cveId} detected by nuclei template ${templateId}: ${name}`,
+            });
+          }
+        }
+      }
+    } catch {
+      // Skip unparseable lines
+      console.warn("[API] Skipping unparseable nuclei JSONL line");
+    }
+  }
+
+  // Compute severity summary
+  const summary = {
+    total: findings.length,
+    critical: findings.filter(f => f.severity === "critical").length,
+    high: findings.filter(f => f.severity === "high").length,
+    medium: findings.filter(f => f.severity === "medium").length,
+    low: findings.filter(f => f.severity === "low").length,
+    info: findings.filter(f => f.severity === "info").length,
+    withCurlCommand: findings.filter(f => f.curlCommand).length,
+    withExtractedResults: findings.filter(f => f.extractedResults.length > 0).length,
+  };
+
+  return { target, scanType: "nuclei", findings, vulnerabilities, summary };
+}
+
+function normalizeSeverity(severity: string): string {
+  const s = severity.toLowerCase().trim();
+  if (["critical", "high", "medium", "low", "info"].includes(s)) return s;
+  if (s === "unknown" || s === "") return "info";
+  return s;
+}
+
 // ─── Temp file helpers ──────────────────────────────────────────────────────
 
 const TMP_DIR = "/tmp/vulnguard-scans";
@@ -264,7 +419,7 @@ function ensureTmpDir() {
 
 // ─── Result Processor ───────────────────────────────────────────────────────
 
-export async function processScanResults(scanId: string, scanType: string): Promise<{ status: string; results: ScanResult | NiktoScanResult | null; error: string | null }> {
+export async function processScanResults(scanId: string, scanType: string): Promise<{ status: string; results: ScanResultType | null; error: string | null }> {
   const statusFile = join(TMP_DIR, `${scanId}.status`);
 
   // Check status file for errors
@@ -274,8 +429,42 @@ export async function processScanResults(scanId: string, scanType: string): Prom
       return { status: "Failed", results: null, error: status.slice(6) };
     }
     if (status === "completed") {
-      if (scanType === "nikto") {
-        // Process Nikto CSV
+      if (scanType === "nuclei") {
+        // ─── Process Nuclei JSONL ──────────────────────────────────────────
+        const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
+        let result: NucleiScanResult = {
+          target: "", scanType: "nuclei",
+          findings: [], vulnerabilities: [],
+          summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
+        };
+
+        if (existsSync(jsonlFile)) {
+          try {
+            const jsonl = readFileSync(jsonlFile, "utf-8");
+            if (jsonl.trim().length > 0) {
+              result = parseNucleiJsonl("", jsonl);
+            }
+          } catch (err) {
+            console.error("[API] Error parsing Nuclei JSONL:", err);
+          }
+        }
+
+        // Update DB
+        try {
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Completed", results: JSON.stringify(result) },
+          });
+        } catch {}
+
+        // Clean up temp files
+        try { unlinkSync(jsonlFile); } catch {}
+        try { unlinkSync(statusFile); } catch {}
+
+        return { status: "Completed", results: result, error: null };
+
+      } else if (scanType === "nikto") {
+        // ─── Process Nikto CSV ─────────────────────────────────────────────
         const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
         let result: NiktoScanResult = { target: "", scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
 
@@ -290,7 +479,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           }
         }
 
-        // Update DB
         try {
           await db.scan.update({
             where: { id: scanId },
@@ -298,16 +486,16 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           });
         } catch {}
 
-        // Clean up temp files
         try { unlinkSync(csvFile); } catch {}
         try { unlinkSync(statusFile); } catch {}
 
         return { status: "Completed", results: result, error: null };
+
       } else {
-        // Process nmap XML files
+        // ─── Process Nmap XML ──────────────────────────────────────────────
         const xmlFile = join(TMP_DIR, `${scanId}.xml`);
         const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
-        let result: ScanResult = { target: "", ports: [], vulnerabilities: [] };
+        let result: NmapScanResult = { target: "", ports: [], vulnerabilities: [] };
 
         if (existsSync(xmlFile)) {
           try {
@@ -318,7 +506,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           } catch {}
         }
 
-        // Also check vuln XML
         if (existsSync(vulnXmlFile)) {
           try {
             const vulnXml = readFileSync(vulnXmlFile, "utf-8");
@@ -338,7 +525,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           } catch {}
         }
 
-        // Update DB
         try {
           await db.scan.update({
             where: { id: scanId },
@@ -346,7 +532,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           });
         } catch {}
 
-        // Clean up temp files
         try { unlinkSync(xmlFile); } catch {}
         try { unlinkSync(vulnXmlFile); } catch {}
         try { unlinkSync(statusFile); } catch {}
@@ -357,6 +542,14 @@ export async function processScanResults(scanId: string, scanType: string): Prom
   }
 
   return { status: "Running", results: null, error: null };
+}
+
+// ─── Scan Type Resolver ─────────────────────────────────────────────────────
+
+function resolveScanType(scanType: string): "nmap" | "nikto" | "nuclei" {
+  if (scanType === "nikto") return "nikto";
+  if (scanType === "nuclei") return "nuclei";
+  return "nmap";
 }
 
 // ─── API Route Handler ─────────────────────────────────────────────────────
@@ -385,8 +578,6 @@ export async function POST(request: NextRequest) {
     }
 
     // ─── DNS Verification Gate ────────────────────────────────────────────
-    // Domain targets (not IPs) must be verified via DNS TXT record
-    // unless skipVerification is set (used by scheduler)
     const skipVerification = body.skipVerification === true;
 
     if (!isIPAddress(targetTrimmed) && !skipVerification) {
@@ -403,7 +594,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const effectiveScanType = scanType === "nikto" ? "nikto" : "nmap";
+    const effectiveScanType = resolveScanType(scanType || "nmap");
     const scanId = uuidv4();
 
     ensureTmpDir();
@@ -412,7 +603,28 @@ export async function POST(request: NextRequest) {
       data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running" },
     });
 
-    if (effectiveScanType === "nikto") {
+    if (effectiveScanType === "nuclei") {
+      // Spawn Nuclei via standalone shell script
+      const scriptPath = resolve(process.cwd(), "run-nuclei-scan.sh");
+      const scanPort = port || "80";
+      try {
+        execSync(
+          `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nuclei-${scanId}.log &`,
+          {
+            timeout: 5000,
+            shell: "/bin/bash",
+            env: {
+              ...process.env,
+              HOME: process.env.HOME || "/home/z",
+            },
+          }
+        );
+      } catch {
+        // Background process — always returns 0
+      }
+      console.log(`[API] Spawned nuclei script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
+
+    } else if (effectiveScanType === "nikto") {
       // Spawn Nikto via standalone shell script
       const scriptPath = resolve(process.cwd(), "run-nikto-scan.sh");
       const scanPort = port || "80";
@@ -432,6 +644,7 @@ export async function POST(request: NextRequest) {
         // Background & always returns 0 — the process runs independently
       }
       console.log(`[API] Spawned nikto script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
+
     } else {
       // Spawn nmap via standalone shell script
       const scriptPath = resolve(process.cwd(), "run-nmap-scan.sh");
@@ -453,14 +666,18 @@ export async function POST(request: NextRequest) {
       console.log(`[API] Spawned nmap script for scan ${scanId}, target ${targetTrimmed}`);
     }
 
+    const engineMessages: Record<string, string> = {
+      nuclei: "Nuclei vulnerability scan initiated. Poll GET /api/scan/[id] for results.",
+      nikto: "Nikto web vulnerability scan initiated. Poll GET /api/scan/[id] for results.",
+      nmap: "Nmap scan initiated. Poll GET /api/scan/[id] for results.",
+    };
+
     return NextResponse.json({
       scan_id: scanId,
       target: targetTrimmed,
       scan_type: effectiveScanType,
       status: "Running",
-      message: effectiveScanType === "nikto"
-        ? "Nikto web vulnerability scan initiated. Poll GET /api/scan/[id] for results."
-        : "Nmap scan initiated. Poll GET /api/scan/[id] for results.",
+      message: engineMessages[effectiveScanType],
     }, { status: 201 });
 
   } catch (error) {
@@ -469,4 +686,4 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export { parseNmapXml, parseNiktoCsv };
+export { parseNmapXml, parseNiktoCsv, parseNucleiJsonl };
