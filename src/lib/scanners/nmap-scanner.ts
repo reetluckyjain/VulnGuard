@@ -60,7 +60,7 @@ const xmlParser = new XMLParser({
   isArray: () => false,
 });
 
-type XmlObj = Record<string, unknown> | string | number | boolean | undefined | null | XmlObj[];
+type XmlObj = any;
 
 /**
  * Parse nmap XML output and extract ports + vulnerabilities
@@ -72,13 +72,13 @@ function parseNmapXml(target: string, xmlObj: XmlObj): ScanResult {
   const nmaprun = xmlObj?.nmaprun;
   if (!nmaprun) return { target, ports, vulnerabilities };
 
-  const hosts = ensureArray(nmaprun.host);
+  const hosts = ensureArray<XmlObj>(nmaprun.host);
 
   for (const host of hosts) {
     // Check host state
     if (host?.state?.["@_state"] === "down") continue;
 
-    const portList = ensureArray(host?.ports?.port);
+    const portList = ensureArray<XmlObj>(host?.ports?.port);
 
     for (const port of portList) {
       const portId = parseInt(port?.["@_portid"] || "0", 10);
@@ -110,7 +110,7 @@ function parseNmapXml(target: string, xmlObj: XmlObj): ScanResult {
       });
 
       // Parse script output for CVEs
-      const scripts = ensureArray(port?.script);
+      const scripts = ensureArray<XmlObj>(port?.script);
       for (const script of scripts) {
         const scriptId = script?.["@_id"] || "unknown";
         const scriptOutput = script?.["@_output"] || "";
@@ -119,15 +119,15 @@ function parseNmapXml(target: string, xmlObj: XmlObj): ScanResult {
         const textParts: string[] = [scriptOutput];
 
         // Check elem children
-        const scriptElems = ensureArray(script?.elem);
+        const scriptElems = ensureArray<XmlObj>(script?.elem);
         for (const elem of scriptElems) {
           if (elem?.["#text"]) textParts.push(elem["#text"]);
         }
 
         // Check table children
-        const scriptTables = ensureArray(script?.table);
+        const scriptTables = ensureArray<XmlObj>(script?.table);
         for (const table of scriptTables) {
-          const tableElems = ensureArray(table?.elem);
+          const tableElems = ensureArray<XmlObj>(table?.elem);
           for (const elem of tableElems) {
             if (elem?.["#text"]) textParts.push(elem["#text"]);
           }
