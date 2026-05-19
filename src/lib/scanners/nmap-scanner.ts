@@ -60,7 +60,7 @@ const xmlParser = new XMLParser({
   isArray: () => false,
 });
 
-type XmlObj = any;
+type XmlObj = Record<string, unknown> | string | number | boolean | undefined | null | XmlObj[];
 
 /**
  * Parse nmap XML output and extract ports + vulnerabilities
