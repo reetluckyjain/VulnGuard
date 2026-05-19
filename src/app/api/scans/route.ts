@@ -1,24 +1,8 @@
 import { NextResponse } from "next/server";
-import { db, isDatabaseAvailable } from "@/lib/db";
-
-/**
- * GET /api/scans — List scan history
- *
- * On Vercel/serverless: Returns empty list if database is not configured.
- * On self-hosted VPS: Returns scan history from DB.
- */
+import { db } from "@/lib/db";
 
 export async function GET() {
   try {
-    const dbAvailable = await isDatabaseAvailable();
-    if (!dbAvailable) {
-      return NextResponse.json({
-        scans: [],
-        notice: "Database not configured. Set DATABASE_URL environment variable to enable scan history. See README for setup instructions.",
-        deployment_mode: "serverless",
-      });
-    }
-
     const scans = await db.scan.findMany({
       orderBy: { createdAt: "desc" },
       take: 50,

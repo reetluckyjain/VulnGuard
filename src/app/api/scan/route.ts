@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, isDatabaseAvailable } from "@/lib/db";
+import { db } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
 import { execSync } from "child_process";
 import { readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
@@ -13,8 +13,8 @@ import { join, resolve } from "path";
  *   - nikto: Web vulnerability scanning (HTTP-level checks)
  *   - nuclei: Template-based bug hunting (XSS, SQLi, secrets, CVEs)
  *
- * On Vercel/serverless: Scanners are not available (returns 501).
- * On self-hosted VPS: Spawns scanner scripts that run independently.
+ * Spawns the scanner via a standalone shell script that runs completely independently.
+ * The script writes output to temp files, which are read by the GET route.
  *
  * NO MOCK DATA — Real scans only.
  */
@@ -545,6 +545,7 @@ export async function POST(request: NextRequest) {
     }
 
     const effectiveScanType = resolveScanType(scanType || "nmap");
+    const scanId = uuidv4();
 
     // Check if scanner script exists (won't exist on Vercel/serverless)
     const scriptMap: Record<string, string> = {
@@ -563,17 +564,6 @@ export async function POST(request: NextRequest) {
         deployment_mode: "serverless",
       }, { status: 501 });
     }
-
-    // Check database availability before creating scan record
-    const dbAvailable = await isDatabaseAvailable();
-    if (!dbAvailable) {
-      return NextResponse.json({
-        error: "Database not configured. Set DATABASE_URL environment variable to enable scan tracking. See README for setup instructions.",
-        deployment_mode: "serverless",
-      }, { status: 503 });
-    }
-
-    const scanId = uuidv4();
 
     ensureTmpDir();
 
