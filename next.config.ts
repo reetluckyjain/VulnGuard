@@ -5,7 +5,7 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: false,
   },
   reactStrictMode: true,
-  serverExternalPackages: ["better-sqlite3"],
+  serverExternalPackages: ["@neondatabase/serverless"],
 };
 
 export default nextConfig;

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { db, isDatabaseAvailable } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
 import { execSync } from "child_process";
 import { readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
@@ -13,8 +13,8 @@ import { join, resolve } from "path";
  *   - nikto: Web vulnerability scanning (HTTP-level checks)
  *   - nuclei: Template-based bug hunting (XSS, SQLi, secrets, CVEs)
  *
- * Spawns the scanner via a standalone shell script that runs completely independently.
- * The script writes output to temp files, which are read by the GET route.
+ * On Vercel/serverless: Scanners are not available (returns 501).
+ * On self-hosted VPS: Spawns scanner scripts that run independently.
  *
  * NO MOCK DATA — Real scans only.
  */
@@ -282,20 +282,6 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
 }
 
 // ─── Nuclei JSONL Parsing ───────────────────────────────────────────────────
-//
-// Nuclei outputs one JSON object per line. Each line represents a finding.
-// Key fields we extract:
-//   - template-id: The specific check that fired (e.g. "http/cves/CVE-2021-44228")
-//   - info.name: Human-readable vulnerability name
-//   - info.severity: critical, high, medium, low, info
-//   - type: Protocol type (http, dns, etc.)
-//   - matched-at: The exact URL that is vulnerable
-//   - curl-command: Reproduction command (HIGHLY valuable for bug bounty hunters)
-//   - extracted-results: Data nuclei extracted (API keys, DB versions, etc.)
-//   - info.tags: Template tags for categorization
-//   - info.reference: Reference URLs
-//   - host: The target host
-//   - timestamp: When the finding was discovered
 
 function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
   const findings: NucleiFinding[] = [];
@@ -306,10 +292,8 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
     try {
       const obj = JSON.parse(line) as Record<string, unknown>;
 
-      // Extract nested info object
       const info = (obj.info as Record<string, unknown>) || {};
 
-      // Core fields
       const templateId = (obj["template-id"] as string) || (obj.templateID as string) || "";
       const name = (info.name as string) || templateId || "Unknown Finding";
       const severity = normalizeSeverity((info.severity as string) || "info");
@@ -318,15 +302,12 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
       const host = (obj.host as string) || target;
       const timestamp = (obj.timestamp as string) || new Date().toISOString();
 
-      // curl-command — the gold mine for bug bounty hunters
       const curlCommand = (obj["curl-command"] as string) || null;
 
-      // Extracted results (API keys, DB versions, paths, etc.)
       const extractedResults = Array.isArray(obj["extracted-results"])
         ? (obj["extracted-results"] as string[])
         : [];
 
-      // Tags and references
       const tags = Array.isArray(info.tags)
         ? (info.tags as string[]).map(String)
         : typeof info.tags === "string"
@@ -336,7 +317,6 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
         ? (info.reference as string[]).map(String)
         : [];
 
-      // Build description from name + extracted results
       let description = name;
       if (extractedResults.length > 0) {
         description += ` — Extracted: ${extractedResults.join(", ")}`;
@@ -360,7 +340,6 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
         timestamp,
       });
 
-      // Extract CVEs from template ID and tags
       const cveText = `${templateId} ${tags.join(" ")} ${name}`;
       CVE_REGEX.lastIndex = 0;
       const cveMatches = cveText.match(CVE_REGEX);
@@ -378,12 +357,10 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
         }
       }
     } catch {
-      // Skip unparseable lines
       console.warn("[API] Skipping unparseable nuclei JSONL line");
     }
   }
 
-  // Compute severity summary
   const summary = {
     total: findings.length,
     critical: findings.filter(f => f.severity === "critical").length,
@@ -418,7 +395,6 @@ function ensureTmpDir() {
 export async function processScanResults(scanId: string, scanType: string): Promise<{ status: string; results: ScanResultType | null; error: string | null }> {
   const statusFile = join(TMP_DIR, `${scanId}.status`);
 
-  // Check status file for errors
   if (existsSync(statusFile)) {
     const status = readFileSync(statusFile, "utf-8").trim();
     if (status.startsWith("error:")) {
@@ -426,7 +402,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
     }
     if (status === "completed") {
       if (scanType === "nuclei") {
-        // ─── Process Nuclei JSONL ──────────────────────────────────────────
         const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
         let result: NucleiScanResult = {
           target: "", scanType: "nuclei",
@@ -445,7 +420,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           }
         }
 
-        // Update DB
         try {
           await db.scan.update({
             where: { id: scanId },
@@ -453,14 +427,12 @@ export async function processScanResults(scanId: string, scanType: string): Prom
           });
         } catch {}
 
-        // Clean up temp files
         try { unlinkSync(jsonlFile); } catch {}
         try { unlinkSync(statusFile); } catch {}
 
         return { status: "Completed", results: result, error: null };
 
       } else if (scanType === "nikto") {
-        // ─── Process Nikto CSV ─────────────────────────────────────────────
         const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
         let result: NiktoScanResult = { target: "", scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
 
@@ -488,7 +460,6 @@ export async function processScanResults(scanId: string, scanType: string): Prom
         return { status: "Completed", results: result, error: null };
 
       } else {
-        // ─── Process Nmap XML ──────────────────────────────────────────────
         const xmlFile = join(TMP_DIR, `${scanId}.xml`);
         const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
         let result: NmapScanResult = { target: "", ports: [], vulnerabilities: [] };
@@ -574,7 +545,6 @@ export async function POST(request: NextRequest) {
     }
 
     const effectiveScanType = resolveScanType(scanType || "nmap");
-    const scanId = uuidv4();
 
     // Check if scanner script exists (won't exist on Vercel/serverless)
     const scriptMap: Record<string, string> = {
@@ -593,6 +563,17 @@ export async function POST(request: NextRequest) {
         deployment_mode: "serverless",
       }, { status: 501 });
     }
+
+    // Check database availability before creating scan record
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) {
+      return NextResponse.json({
+        error: "Database not configured. Set DATABASE_URL environment variable to enable scan tracking. See README for setup instructions.",
+        deployment_mode: "serverless",
+      }, { status: 503 });
+    }
+
+    const scanId = uuidv4();
 
     ensureTmpDir();
 

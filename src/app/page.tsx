@@ -133,6 +133,49 @@ function normalizeStatus(status: string): ScanHistoryEntry['status'] {
   return 'pending'
 }
 
+/** Detects if running on a serverless platform (Vercel) where scanners aren't available */
+function ServerlessNotice() {
+  const [isServerless, setIsServerless] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: 'probe', isAuthorized: true, scanType: 'nmap' }),
+    }).then(res => {
+      if (res.status === 501 || res.status === 503) setIsServerless(true)
+    }).catch(() => {
+      // Network error — likely serverless without DB
+      setIsServerless(true)
+    })
+  }, [])
+
+  if (!isServerless) return null
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+      <Card className="border-orange-500/30 bg-orange-500/5">
+        <CardContent className="p-4 sm:p-6">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="h-5 w-5 text-orange-500 mt-0.5 shrink-0" />
+            <div className="flex-1">
+              <h3 className="font-semibold text-orange-400 text-sm">Serverless Deployment Detected</h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                Scanning tools (Nmap, Nikto, Nuclei) require a self-hosted server with the tools installed.
+                Deploy on a VPS for full scanning functionality. The AI Remediation engine still works on serverless.
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                To enable scanning, set the <code className="bg-muted px-1 py-0.5 rounded text-xs">DATABASE_URL</code> environment variable
+                and deploy on a server with nmap, nikto, and nuclei installed.
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </motion.div>
+  )
+}
+
 export default function Home() {
   const [target, setTarget] = useState('')
   const [scanType, setScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
@@ -235,7 +278,12 @@ export default function Home() {
 
       if (!response || !response.ok) {
         const errorData = response ? await response.json().catch(() => ({})) : {}
-        throw new Error((errorData as Record<string,string>).error || lastError || 'Scan request failed after 3 attempts')
+        const errorObj = errorData as Record<string,string>
+        // 501 = Scanner not available (serverless), 503 = DB not configured — don't retry
+        if (response && (response.status === 501 || response.status === 503)) {
+          throw new Error(errorObj.error || 'Scanner not available in this environment')
+        }
+        throw new Error(errorObj.error || lastError || 'Scan request failed after 3 attempts')
       }
       const data = await response.json() as Record<string, unknown>
       const returnedScanId = (data.scan_id as string) || scanId
@@ -411,6 +459,8 @@ export default function Home() {
         </div>
       </header>
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+        {/* Serverless Notice — shown when scanners are not available */}
+        <ServerlessNotice />
         {/* Authorization */}
         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
           <Card className="border-yellow-500/30 bg-yellow-500/5">

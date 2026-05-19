@@ -1,14 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { db, isDatabaseAvailable } from "@/lib/db";
 import { processScanResults } from "../route";
 
 /**
  * GET /api/scan/[id] — Get scan status and results
  *
- * Checks for scanner output files and processes them into results.
- * Supports both nmap and nikto scan types.
- * The scanner process runs detached and writes to temp files.
- * This route reads those files and updates the DB.
+ * On Vercel/serverless: Returns 503 if database is not configured.
+ * On self-hosted VPS: Returns scan status from DB + temp file processing.
  */
 
 export async function GET(
@@ -16,9 +14,17 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    // Check database availability
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) {
+      return NextResponse.json({
+        error: "Database not configured. Set DATABASE_URL environment variable. See README for setup instructions.",
+        deployment_mode: "serverless",
+      }, { status: 503 });
+    }
+
     const { id } = await params;
 
-    // First check the DB for existing completed results
     const scan = await db.scan.findUnique({ where: { id } });
 
     if (!scan) {
@@ -27,7 +33,6 @@ export async function GET(
 
     const scanType = scan.scanType || "nmap";
 
-    // If already completed or failed, return from DB
     if (scan.status === "Completed") {
       let parsedResults = null;
       if (scan.results) {
@@ -63,7 +68,6 @@ export async function GET(
       });
     }
 
-    // Scan is still Running or Pending — check for output files
     const processed = await processScanResults(id, scanType);
 
     if (processed.status === "Completed" && processed.results) {
@@ -90,7 +94,6 @@ export async function GET(
       });
     }
 
-    // Still running
     return NextResponse.json({
       scan_id: scan.id,
       target: scan.target,

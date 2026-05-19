@@ -1,19 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { db, isDatabaseAvailable } from "@/lib/db";
 
 /**
  * Schedule CRUD API
  *
+ * On Vercel/serverless: Returns 503 if database is not configured.
+ * On self-hosted VPS: Full CRUD for scheduled scans.
+ *
  * POST   /api/schedules          — Create a new scheduled scan
  * GET    /api/schedules          — List all schedules
- * PUT    /api/schedules?id=xxx   — Update a schedule (toggle active, change frequency)
+ * PUT    /api/schedules?id=xxx   — Update a schedule
  * DELETE /api/schedules?id=xxx   — Delete a schedule
- *
- * Frequency maps to nextRunAt:
- *   - hourly  → next run in 1 hour
- *   - daily   → next run in 24 hours
- *   - weekly  → next run in 7 days
- *   - monthly → next run in 30 days
  */
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -29,10 +26,20 @@ function computeNextRun(frequency: string): Date {
   }
 }
 
+function serverlessResponse() {
+  return NextResponse.json({
+    error: "Database not configured. Set DATABASE_URL environment variable to enable scheduling. See README for setup instructions.",
+    deployment_mode: "serverless",
+  }, { status: 503 });
+}
+
 // ─── POST: Create schedule ─────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
   try {
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) return serverlessResponse();
+
     const body = await request.json();
     const { target, scanType, port, frequency } = body as {
       target: string; scanType?: string; port?: string; frequency: string;
@@ -81,6 +88,15 @@ export async function POST(request: NextRequest) {
 
 export async function GET() {
   try {
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) {
+      return NextResponse.json({
+        schedules: [],
+        notice: "Database not configured. Set DATABASE_URL environment variable to enable scheduling.",
+        deployment_mode: "serverless",
+      });
+    }
+
     const schedules = await db.schedule.findMany({
       orderBy: { nextRunAt: "asc" },
       take: 100,
@@ -110,6 +126,9 @@ export async function GET() {
 
 export async function PUT(request: NextRequest) {
   try {
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) return serverlessResponse();
+
     const id = request.nextUrl.searchParams.get("id");
     if (!id) {
       return NextResponse.json({ error: "Schedule ID is required" }, { status: 400 });
@@ -129,7 +148,6 @@ export async function PUT(request: NextRequest) {
 
     if (typeof isActive === "boolean") {
       updateData.isActive = isActive;
-      // If re-activating, recalculate nextRunAt
       if (isActive) {
         updateData.nextRunAt = computeNextRun(existing.frequency);
       }
@@ -169,6 +187,9 @@ export async function PUT(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   try {
+    const dbAvailable = await isDatabaseAvailable();
+    if (!dbAvailable) return serverlessResponse();
+
     const id = request.nextUrl.searchParams.get("id");
     if (!id) {
       return NextResponse.json({ error: "Schedule ID is required" }, { status: 400 });
