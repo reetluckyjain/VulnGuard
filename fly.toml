@@ -1,0 +1,41 @@
+# ─── VulnGuard on Fly.io ────────────────────────────────────────────────────
+# Free tier: 3 shared-cpu-1x VMs, 160GB bandwidth/month
+#
+# Deploy: fly launch   (first time)
+#         fly deploy   (subsequent deploys)
+#
+# Set secrets: fly secrets set DATABASE_URL="file:./db/custom.db"
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = "vulnguard"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3000"
+  DATABASE_URL = "file:./db/custom.db"
+  NUCLEI_TEMPLATES_DIR = "/root/nuclei-templates"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+# Persistent volume for SQLite database
+[[mounts]]
+  source = "vulnguard_data"
+  destination = "/app/prisma/db"
+
+[vm]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

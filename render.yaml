@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: vulnguard
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        value: file:./db/custom.db
+      - key: NUCLEI_TEMPLATES_DIR
+        value: /root/nuclei-templates
+      - key: PORT
+        value: 3000
+      - key: NODE_ENV
+        value: production

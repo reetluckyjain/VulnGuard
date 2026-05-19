@@ -5,6 +5,7 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: false,
   },
   reactStrictMode: true,
+  output: "standalone",
   serverExternalPackages: ["better-sqlite3"],
 };
 

@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: `Frequency must be one of: ${validFreqs.join(", ")}` }, { status: 400 });
     }
 
-    const effectiveScanType = scanType === "nikto" ? "nikto" : "nmap";
+    const effectiveScanType = scanType === "nikto" ? "nikto" : scanType === "nuclei" ? "nuclei" : "nmap";
     const nextRunAt = computeNextRun(frequency);
 
     const schedule = await db.schedule.create({
@@ -140,7 +140,7 @@ export async function PUT(request: NextRequest) {
       updateData.nextRunAt = computeNextRun(frequency);
     }
 
-    if (scanType) updateData.scanType = scanType === "nikto" ? "nikto" : "nmap";
+    if (scanType) updateData.scanType = scanType === "nikto" ? "nikto" : scanType === "nuclei" ? "nuclei" : "nmap";
     if (port) updateData.port = port;
 
     const updated = await db.schedule.update({
