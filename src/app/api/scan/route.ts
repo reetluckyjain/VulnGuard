@@ -576,27 +576,37 @@ export async function POST(request: NextRequest) {
     const effectiveScanType = resolveScanType(scanType || "nmap");
     const scanId = uuidv4();
 
+    // Check if scanner script exists (won't exist on Vercel/serverless)
+    const scriptMap: Record<string, string> = {
+      nuclei: "run-nuclei-scan.sh",
+      nikto: "run-nikto-scan.sh",
+      nmap: "run-nmap-scan.sh",
+    };
+    const scriptFile = scriptMap[effectiveScanType];
+    const scriptPath = resolve(process.cwd(), scriptFile);
+
+    if (!existsSync(scriptPath)) {
+      return NextResponse.json({
+        error: `Scanner tool not available in this environment. The ${effectiveScanType} scanner requires a self-hosted server with the scanning tools installed. Deploy on a VPS for full functionality. See the README for setup instructions.`,
+        scan_type: effectiveScanType,
+        target: targetTrimmed,
+        deployment_mode: "serverless",
+      }, { status: 501 });
+    }
+
     ensureTmpDir();
 
     await db.scan.create({
       data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running" },
     });
 
+    const scanPort = port || "80";
+
     if (effectiveScanType === "nuclei") {
-      // Spawn Nuclei via standalone shell script
-      const scriptPath = resolve(process.cwd(), "run-nuclei-scan.sh");
-      const scanPort = port || "80";
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nuclei-${scanId}.log &`,
-          {
-            timeout: 5000,
-            shell: "/bin/bash",
-            env: {
-              ...process.env,
-              HOME: process.env.HOME || "/home/z",
-            },
-          }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
         );
       } catch {
         // Background process — always returns 0
@@ -604,20 +614,10 @@ export async function POST(request: NextRequest) {
       console.log(`[API] Spawned nuclei script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
 
     } else if (effectiveScanType === "nikto") {
-      // Spawn Nikto via standalone shell script
-      const scriptPath = resolve(process.cwd(), "run-nikto-scan.sh");
-      const scanPort = port || "80";
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nikto-${scanId}.log &`,
-          {
-            timeout: 5000,
-            shell: "/bin/bash",
-            env: {
-              ...process.env,
-              HOME: process.env.HOME || "/home/z",
-            },
-          }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
         );
       } catch {
         // Background & always returns 0 — the process runs independently
@@ -625,19 +625,10 @@ export async function POST(request: NextRequest) {
       console.log(`[API] Spawned nikto script for scan ${scanId}, target ${targetTrimmed}:${scanPort}`);
 
     } else {
-      // Spawn nmap via standalone shell script
-      const scriptPath = resolve(process.cwd(), "run-nmap-scan.sh");
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} &>/tmp/vulnguard-nmap-${scanId}.log &`,
-          {
-            timeout: 5000,
-            shell: "/bin/bash",
-            env: {
-              ...process.env,
-              HOME: process.env.HOME || "/home/z",
-            },
-          }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
         );
       } catch {
         // Background & always returns 0 — the process runs independently

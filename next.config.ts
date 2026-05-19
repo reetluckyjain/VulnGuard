@@ -1,17 +1,11 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
-  /* config options here */
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
-  reactStrictMode: false,
-  allowedDevOrigins: [
-    ".space-z.ai",
-    ".z.ai",
-    "localhost",
-  ],
+  reactStrictMode: true,
+  serverExternalPackages: ["better-sqlite3"],
 };
 
 export default nextConfig;
