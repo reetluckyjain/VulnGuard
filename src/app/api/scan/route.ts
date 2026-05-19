@@ -577,7 +577,7 @@ export async function POST(request: NextRequest) {
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nuclei-${scanId}.log &`,
-          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z", PATH: `${process.env.HOME || "/home/z"}/.local/bin:/usr/local/bin:/usr/bin:${process.env.PATH || ""}` } }
         );
       } catch {
         // Background process — always returns 0
@@ -588,7 +588,7 @@ export async function POST(request: NextRequest) {
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} ${scanPort} &>/tmp/vulnguard-nikto-${scanId}.log &`,
-          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z", PATH: `${process.env.HOME || "/home/z"}/.local/bin:/usr/local/bin:/usr/bin:${process.env.PATH || ""}` } }
         );
       } catch {
         // Background & always returns 0 — the process runs independently
@@ -599,7 +599,7 @@ export async function POST(request: NextRequest) {
       try {
         execSync(
           `nohup bash ${scriptPath} ${scanId} ${targetTrimmed} &>/tmp/vulnguard-nmap-${scanId}.log &`,
-          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z" } }
+          { timeout: 5000, shell: "/bin/bash", env: { ...process.env, HOME: process.env.HOME || "/home/z", PATH: `${process.env.HOME || "/home/z"}/.local/bin:/usr/local/bin:/usr/bin:${process.env.PATH || ""}` } }
         );
       } catch {
         // Background & always returns 0 — the process runs independently

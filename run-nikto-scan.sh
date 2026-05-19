@@ -8,8 +8,9 @@ TARGET="$2"
 PORT="${3:-80}"
 TMP_DIR="/tmp/vulnguard-scans"
 
-# Auto-detect nikto from PATH
-NIKTO="$(command -v nikto 2>/dev/null || echo '/usr/bin/nikto')"
+# Auto-detect nikto from PATH (include user-local bin)
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+NIKTO="$(command -v nikto 2>/dev/null || echo '/tmp/nikto/program/nikto.pl')"
 
 CSV_FILE="${TMP_DIR}/${SCAN_ID}-nikto.csv"
 STATUS_FILE="${TMP_DIR}/${SCAN_ID}.status"

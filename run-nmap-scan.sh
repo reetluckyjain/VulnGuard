@@ -7,7 +7,8 @@ SCAN_ID="$1"
 TARGET="$2"
 TMP_DIR="/tmp/vulnguard-scans"
 
-# Auto-detect nmap from PATH
+# Auto-detect nmap from PATH (include user-local bin)
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
 NMAP="$(command -v nmap 2>/dev/null || echo '/usr/bin/nmap')"
 
 XML_FILE="${TMP_DIR}/${SCAN_ID}.xml"

@@ -13,7 +13,8 @@ TARGET="$2"
 PORT="${3:-}"
 TMP_DIR="/tmp/vulnguard-scans"
 
-# Auto-detect nuclei from PATH
+# Auto-detect nuclei from PATH (include user-local bin)
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
 NUCLEI="$(command -v nuclei 2>/dev/null || echo '/home/z/.local/bin/nuclei')"
 NUCLEI_TEMPLATES="${NUCLEI_TEMPLATES_DIR:-$HOME/nuclei-templates}"
 
