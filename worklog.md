@@ -61,3 +61,37 @@ Stage Summary:
 - nmap v7.94, nuclei v3.8.0, nikto v2.6.0
 - Shell scripts already had PATH=$HOME/.local/bin so they work correctly
 - All 3 scan types confirmed working end-to-end
+
+---
+Task ID: 4
+Agent: main
+Task: Add Full Scan mode - unified scan with security score
+
+Work Log:
+- Created run-full-scan.sh that spawns all 3 engines in parallel with atomic done-file tracking
+- Added 'full' scan type to API route with FullScanResult type
+- Built security score calculator (0-100, grades A+ to F) with real deduction algorithm:
+  - Open ports: -2 per port, -5 per high-risk port (23, 21, 445, 3389, etc.)
+  - Nmap vulns: -5 per vulnerability
+  - Unique CVEs: -5 per CVE
+  - Nikto web findings: -8 per high, -3 per medium
+  - Nuclei critical: -15 each, Nuclei high: -8 each
+- Built vulnerability hints aggregator that combines findings from all 3 engines, sorted by severity
+- Updated page.tsx with Full Scan UI:
+  - "Full Scan" option in engine selector
+  - Security score circular gauge (SVG) with grade (A+ to F) and color coding
+  - Summary stats cards (open ports, vulnerabilities, CVEs, web findings)
+  - Score breakdown table showing deduction details
+  - Open ports table
+  - Vulnerability hints list with source badges (nmap/nikto/nuclei)
+  - Collapsible individual engine details sections
+- Fixed race condition in full-scan.sh (atomic done files instead of shared counter)
+- Fixed sub-scan file path mapping in API route
+- Rebuilt scanner tools after /tmp cleanup (nmap from source, nuclei binary, nikto patched)
+- Tested full scan end-to-end: scanme.nmap.org → Score 81/100 (Grade B)
+
+Stage Summary:
+- Full scan mode works: all 3 engines in parallel, unified results, real security score
+- Security score algorithm: starts at 100, deducts based on real findings
+- scanme.nmap.org result: 4 open ports, 10 web findings, score 81/100 (B)
+- All existing individual scan modes still work unchanged

@@ -7,7 +7,7 @@ import {
   RotateCcw, ExternalLink, AlertCircle, CheckCircle2, Wifi,
   WifiOff, Loader2, Info, Globe, Bug, FileWarning, ExternalLinkIcon,
   Sparkles, Terminal, Copy, Check, Zap, Wrench,
-  Calendar, Play, Pause, Trash2, Timer,
+  Calendar, Play, Pause, Trash2, Timer, ChevronDown, ChevronUp,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -60,7 +60,48 @@ interface NucleiScanResult {
   }
 }
 
-type ScanResult = NmapScanResult | NiktoScanResult | NucleiScanResult
+interface FullScanSecurityScore {
+  score: number;
+  grade: string;
+  label: string;
+  breakdown: {
+    openPorts: { count: number; deduction: number; details: string };
+    vulnerabilities: { count: number; deduction: number; details: string };
+    cves: { count: number; deduction: number; details: string };
+    webFindings: { count: number; deduction: number; details: string };
+    nucleiCritical: { count: number; deduction: number; details: string };
+    nucleiHigh: { count: number; deduction: number; details: string };
+  };
+}
+
+interface VulnerabilityHint {
+  source: "nmap" | "nikto" | "nuclei";
+  severity: string;
+  title: string;
+  description: string;
+  port?: number;
+  reference?: string[];
+}
+
+interface FullScanResult {
+  target: string;
+  scanType: "full";
+  nmap: NmapScanResult | null;
+  nikto: NiktoScanResult | null;
+  nuclei: NucleiScanResult | null;
+  securityScore: FullScanSecurityScore;
+  openPorts: PortInfo[];
+  vulnerabilityHints: VulnerabilityHint[];
+  summary: {
+    totalOpenPorts: number;
+    totalVulnerabilities: number;
+    totalCves: number;
+    totalWebFindings: number;
+    enginesCompleted: number;
+  };
+}
+
+type ScanResult = NmapScanResult | NiktoScanResult | NucleiScanResult | FullScanResult
 
 interface RemediationItem {
   finding: string
@@ -79,7 +120,7 @@ interface RemediationData {
 }
 
 interface ScanHistoryEntry {
-  id: string; target: string; scanType: 'nmap' | 'nikto' | 'nuclei'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
+  id: string; target: string; scanType: 'nmap' | 'nikto' | 'nuclei' | 'full'; status: 'pending'|'running'|'completed'|'failed'; timestamp: string; results?: ScanResult
 }
 
 
@@ -95,6 +136,10 @@ function isNiktoResult(result: ScanResult | null): result is NiktoScanResult {
 
 function isNucleiResult(result: ScanResult | null): result is NucleiScanResult {
   return !!result && typeof result === 'object' && 'scanType' in result && result.scanType === 'nuclei'
+}
+
+function isFullResult(result: ScanResult | null): result is FullScanResult {
+  return !!result && typeof result === 'object' && 'scanType' in result && result.scanType === 'full'
 }
 
 function stateColor(state: string): string {
@@ -117,6 +162,39 @@ function severityColor(severity: string): string {
   }
 }
 
+function scoreGradeColor(grade: string): string {
+  if (grade.startsWith('A')) return 'text-emerald-400'
+  if (grade === 'B') return 'text-blue-400'
+  if (grade === 'C') return 'text-amber-400'
+  if (grade === 'D') return 'text-orange-400'
+  return 'text-red-500'
+}
+
+function scoreGradeRingColor(grade: string): string {
+  if (grade.startsWith('A')) return 'stroke-emerald-400'
+  if (grade === 'B') return 'stroke-blue-400'
+  if (grade === 'C') return 'stroke-amber-400'
+  if (grade === 'D') return 'stroke-orange-400'
+  return 'stroke-red-500'
+}
+
+function scoreGradeBgColor(grade: string): string {
+  if (grade.startsWith('A')) return 'bg-emerald-500/10 border-emerald-500/30'
+  if (grade === 'B') return 'bg-blue-500/10 border-blue-500/30'
+  if (grade === 'C') return 'bg-amber-500/10 border-amber-500/30'
+  if (grade === 'D') return 'bg-orange-500/10 border-orange-500/30'
+  return 'bg-red-500/10 border-red-500/30'
+}
+
+function sourceBadgeColor(source: string): string {
+  switch (source) {
+    case 'nmap': return 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30'
+    case 'nikto': return 'bg-purple-500/20 text-purple-400 border-purple-500/30'
+    case 'nuclei': return 'bg-rose-500/20 text-rose-400 border-rose-500/30'
+    default: return 'bg-muted text-muted-foreground border-border'
+  }
+}
+
 const cardVariants = {
   hidden: { opacity: 0, y: 20 },
   visible: (i: number) => ({ opacity: 1, y: 0, transition: { delay: i * 0.1, duration: 0.4, ease: 'easeOut' as const } }),
@@ -135,13 +213,13 @@ function normalizeStatus(status: string): ScanHistoryEntry['status'] {
 
 export default function Home() {
   const [target, setTarget] = useState('')
-  const [scanType, setScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
+  const [scanType, setScanType] = useState<'nmap' | 'nikto' | 'nuclei' | 'full'>('nmap')
   const [niktoPort, setNiktoPort] = useState('80')
   const [isAuthorized, setIsAuthorized] = useState(false)
   const [validationError, setValidationError] = useState('')
   const [isScanning, setIsScanning] = useState(false)
   const [currentScanTarget, setCurrentScanTarget] = useState('')
-  const [currentScanType, setCurrentScanType] = useState<'nmap' | 'nikto' | 'nuclei'>('nmap')
+  const [currentScanType, setCurrentScanType] = useState<'nmap' | 'nikto' | 'nuclei' | 'full'>('nmap')
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([])
   const [activeScanId, setActiveScanId] = useState<string | null>(null)
@@ -152,6 +230,11 @@ export default function Home() {
   const [remediationError, setRemediationError] = useState('')
   const [copiedIdx, setCopiedIdx] = useState<string | null>(null)
 
+  // Full scan collapsible sections
+  const [expandedHints, setExpandedHints] = useState<Set<number>>(new Set())
+  const [showNmapDetails, setShowNmapDetails] = useState(false)
+  const [showNiktoDetails, setShowNiktoDetails] = useState(false)
+  const [showNucleiDetails, setShowNucleiDetails] = useState(false)
 
   // Scheduling state
   const [schedules, setSchedules] = useState<ScheduleEntry[]>([])
@@ -162,8 +245,11 @@ export default function Home() {
 
   const isIPAddress = (t: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t)
 
+  // Full scan result
+  const fullResult = isFullResult(scanResult) ? scanResult : null
+
   // Nmap stats
-  const nmapResult = scanResult && !isNiktoResult(scanResult) && !isNucleiResult(scanResult) ? scanResult as NmapScanResult : null
+  const nmapResult = scanResult && !isNiktoResult(scanResult) && !isNucleiResult(scanResult) && !isFullResult(scanResult) ? scanResult as NmapScanResult : null
   const openPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'open').length ?? 0
   const closedPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'closed').length ?? 0
   const filteredPortCount = nmapResult?.ports?.filter(p => p.state?.toLowerCase() === 'filtered').length ?? 0
@@ -182,7 +268,16 @@ export default function Home() {
   const nucleiVulnCount = nucleiResult?.vulnerabilities?.length ?? 0
   const nucleiSummary = nucleiResult?.summary ?? { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 }
 
-  const vulnCount = isNucleiResult(scanResult) ? nucleiVulnCount : isNiktoResult(scanResult) ? niktoVulnCount : nmapVulnCount
+  const vulnCount = isFullResult(scanResult) ? (fullResult?.summary?.totalVulnerabilities ?? 0) : isNucleiResult(scanResult) ? nucleiVulnCount : isNiktoResult(scanResult) ? niktoVulnCount : nmapVulnCount
+
+  const toggleHint = (idx: number) => {
+    setExpandedHints(prev => {
+      const next = new Set(prev)
+      if (next.has(idx)) next.delete(idx)
+      else next.add(idx)
+      return next
+    })
+  }
 
   const handleStartScan = useCallback(async () => {
     if (!target.trim()) { setValidationError('Please enter a target IP or hostname'); return }
@@ -201,7 +296,12 @@ export default function Home() {
     setCurrentScanTarget(target.trim())
     setCurrentScanType(scanType)
     setScanResult(null)
-    setScanStatusText(scanType === 'nikto' ? 'Running real Nikto web scan...' : scanType === 'nuclei' ? 'Running real Nuclei bug hunt...' : 'Running real nmap scan...')
+    setScanStatusText(
+      scanType === 'full' ? 'Running full scan (all 3 engines)...'
+        : scanType === 'nikto' ? 'Running real Nikto web scan...'
+        : scanType === 'nuclei' ? 'Running real Nuclei bug hunt...'
+        : 'Running real nmap scan...'
+    )
     const scanId = `scan-${Date.now()}`
     const historyEntry: ScanHistoryEntry = { id: scanId, target: target.trim(), scanType, status: 'running', timestamp: new Date().toISOString() }
     setScanHistory(prev => [historyEntry, ...prev])
@@ -218,7 +318,7 @@ export default function Home() {
               target: target.trim(),
               isAuthorized: true,
               scanType,
-              port: (scanType === 'nikto' || scanType === 'nuclei') ? niktoPort : undefined,
+              port: (scanType === 'nikto' || scanType === 'nuclei' || scanType === 'full') ? niktoPort : undefined,
             }),
           })
           if (response.ok) break
@@ -244,7 +344,7 @@ export default function Home() {
         setScanResult(data.results as ScanResult)
         setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null)
         setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId, status: (returnedStatus || 'completed') as ScanHistoryEntry['status'], results: data.results as ScanResult } : e))
-        const engine = scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
+        const engine = scanType === 'full' ? 'Full' : scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
         toast({ title: 'Scan Complete', description: `${engine} scan of ${target.trim()} completed` })
       } else if (returnedStatus === 'failed') {
         setIsScanning(false); setCurrentScanTarget('')
@@ -388,12 +488,55 @@ export default function Home() {
     }
   }
 
-  const scanEngineLabel = scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
-  const scanEngineDesc = scanType === 'nikto'
+  const scanEngineLabel = scanType === 'full' ? 'Full Scan' : scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
+  const scanEngineDesc = scanType === 'full'
+    ? 'nmap + nikto + nuclei — All engines in parallel, unified security score'
+    : scanType === 'nikto'
     ? 'nikto -h target -Format csv — Web vulnerability scanner'
     : scanType === 'nuclei'
     ? 'nuclei -u target -jsonl — Template-based bug hunter'
     : 'nmap -sT -sV --script vuln — Network/port scanner'
+
+  // ─── Circular Score Gauge SVG ──────────────────────────────────────────
+  const ScoreGauge = ({ score, grade, label }: { score: number; grade: string; label: string }) => {
+    const radius = 70
+    const circumference = 2 * Math.PI * radius
+    const filled = (score / 100) * circumference
+    const remaining = circumference - filled
+    const ringColor = scoreGradeRingColor(grade)
+    const textColor = scoreGradeColor(grade)
+
+    return (
+      <div className="flex flex-col items-center gap-2">
+        <div className="relative w-44 h-44">
+          <svg viewBox="0 0 180 180" className="w-full h-full -rotate-90">
+            {/* Background track */}
+            <circle cx="90" cy="90" r={radius} fill="none" stroke="currentColor" className="text-muted/30" strokeWidth="10" />
+            {/* Filled arc */}
+            <circle
+              cx="90" cy="90" r={radius} fill="none"
+              className={ringColor}
+              strokeWidth="10"
+              strokeLinecap="round"
+              strokeDasharray={`${filled} ${remaining}`}
+              style={{ transition: 'stroke-dasharray 1s ease-out' }}
+            />
+          </svg>
+          {/* Center text */}
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span className={`text-4xl font-bold ${textColor}`}>{score}</span>
+            <span className="text-sm text-muted-foreground">/ 100</span>
+          </div>
+        </div>
+        <div className="text-center">
+          <Badge variant="outline" className={`text-lg px-4 py-1 font-bold ${scoreGradeBgColor(grade)} ${textColor} border`}>
+            {grade}
+          </Badge>
+          <p className={`text-sm font-semibold mt-2 ${textColor}`}>{label}</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -439,7 +582,7 @@ export default function Home() {
                 <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
                   <div className="flex items-center gap-2 shrink-0">
                     <span className="text-sm font-medium text-muted-foreground">Engine:</span>
-                    <Select value={scanType} onValueChange={(v) => setScanType(v as 'nmap' | 'nikto' | 'nuclei')}>
+                    <Select value={scanType} onValueChange={(v) => setScanType(v as 'nmap' | 'nikto' | 'nuclei' | 'full')}>
                       <SelectTrigger className="w-[180px]"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="nmap">
@@ -451,20 +594,23 @@ export default function Home() {
                         <SelectItem value="nuclei">
                           <span className="flex items-center gap-2"><Bug className="h-3.5 w-3.5" />Nuclei</span>
                         </SelectItem>
+                        <SelectItem value="full">
+                          <span className="flex items-center gap-2"><Shield className="h-3.5 w-3.5" />Full Scan</span>
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
-                  {(scanType === 'nikto' || scanType === 'nuclei') && (
+                  {(scanType === 'nikto' || scanType === 'nuclei' || scanType === 'full') && (
                     <div className="flex items-center gap-2">
                       <span className="text-sm text-muted-foreground shrink-0">Port:</span>
-                      <Input type="text" value={niktoPort} onChange={e => setNiktoPort(e.target.value)} className="w-20 font-mono" placeholder="80" aria-label="Nikto target port" />
+                      <Input type="text" value={niktoPort} onChange={e => setNiktoPort(e.target.value)} className="w-20 font-mono" placeholder="80" aria-label="Target port" />
                     </div>
                   )}
                 </div>
                 {/* Target + scan button */}
                 <div className="flex flex-col sm:flex-row gap-3">
                   <div className="flex-1">
-                    <Input type="text" placeholder={scanType === 'nikto' ? 'e.g., scanme.nmap.org or 192.168.1.1' : 'e.g., scanme.nmap.org or 192.168.1.1'} value={target} onChange={e => { setTarget(e.target.value); if (validationError) setValidationError('') }} onKeyDown={e => { if (e.key === 'Enter') handleStartScan() }} disabled={isScanning} className="font-mono" aria-label="Target IP or hostname" />
+                    <Input type="text" placeholder="e.g., scanme.nmap.org or 192.168.1.1" value={target} onChange={e => { setTarget(e.target.value); if (validationError) setValidationError('') }} onKeyDown={e => { if (e.key === 'Enter') handleStartScan() }} disabled={isScanning} className="font-mono" aria-label="Target IP or hostname" />
                     {validationError && <p className="text-sm text-red-400 mt-1.5 flex items-center gap-1.5"><AlertCircle className="h-3.5 w-3.5" />{validationError}</p>}
                   </div>
                   <div className="flex gap-2">
@@ -476,13 +622,19 @@ export default function Home() {
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Info className="h-3.5 w-3.5 shrink-0" />
-                  {scanType === 'nikto' ? (
+                  {scanType === 'full' ? (
+                    <span>Full scan runs all 3 engines in parallel — Nmap (ports), Nikto (web), Nuclei (templates) — and calculates a security score.</span>
+                  ) : scanType === 'nikto' ? (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nikto -h target -Format csv -C all</code> — Web vulnerability scanner, 100% real data.</span>
                   ) : scanType === 'nuclei' ? (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nuclei -u target -jle results.jsonl</code> — Template-based bug hunter (XSS, SQLi, secrets, CVEs), 100% real data.</span>
                   ) : (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — Network/port scanner, 100% real data.</span>
                   )}
+                </div>
+                {/* Engine description badge */}
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">{scanEngineDesc}</Badge>
                 </div>
               </div>
             </CardContent>
@@ -584,7 +736,9 @@ export default function Home() {
                   <div className="space-y-1">
                     <p className="text-sm text-muted-foreground">{scanStatusText}</p>
                     <p className="text-xs text-muted-foreground/60">
-                      {currentScanType === 'nikto'
+                      {currentScanType === 'full'
+                        ? 'Running all 3 scan engines in parallel — this may take 2-5 minutes.'
+                        : currentScanType === 'nikto'
                         ? 'Running real Nikto web scan — this may take 1-2 minutes.'
                         : currentScanType === 'nuclei'
                         ? 'Running real Nuclei bug hunt — this may take 2-5 minutes.'
@@ -602,257 +756,808 @@ export default function Home() {
           {scanResult && !isScanning && (
             <motion.div variants={staggerContainer} initial="hidden" animate="visible" className="space-y-8">
 
-              {/* Nmap Results */}
-              {nmapResult && (
+              {/* ═══════════════ FULL SCAN RESULTS ═══════════════ */}
+              {fullResult && (
                 <>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                    <motion.div custom={0} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Open Ports</p><p className="text-3xl font-bold mt-1">{openPortCount}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><Server className="h-5 w-5 text-primary" /></div></div>{(closedPortCount > 0 || filteredPortCount > 0) && <p className="text-xs text-muted-foreground mt-2">+{closedPortCount} closed, {filteredPortCount} filtered</p>}</CardContent></Card></motion.div>
-                    <motion.div custom={1} variants={cardVariants}><Card className={nmapVulnCount > 0 ? 'border-orange-500/30 hover:border-orange-500/50' : 'border-emerald-500/30 hover:border-emerald-500/50'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Vulnerabilities</p><p className={`text-3xl font-bold mt-1 ${nmapVulnCount > 0 ? 'text-orange-400' : 'text-emerald-400'}`}>{nmapVulnCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${nmapVulnCount > 0 ? 'bg-orange-500/10' : 'bg-emerald-500/10'}`}>{nmapVulnCount > 0 ? <AlertTriangle className="h-5 w-5 text-orange-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
-                    <motion.div custom={2} variants={cardVariants}><Card className={nmapCveCount > 0 ? 'border-red-500/20 bg-red-500/5' : 'border-emerald-500/20 bg-emerald-500/5'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Unique CVEs</p><p className={`text-3xl font-bold mt-1 ${nmapCveCount > 0 ? 'text-red-400' : 'text-emerald-400'}`}>{nmapCveCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${nmapCveCount > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>{nmapCveCount > 0 ? <AlertTriangle className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
-                    <motion.div custom={3} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Target</p><p className="text-lg font-semibold mt-1 font-mono truncate max-w-[180px]">{nmapResult.target || 'N/A'}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><Server className="h-5 w-5 text-primary" /></div></div><p className="text-xs text-muted-foreground mt-2">{nmapResult.ports?.length ?? 0} total ports scanned</p></CardContent></Card></motion.div>
-                  </div>
-                  <motion.div custom={4} variants={cardVariants}>
-                    <Card>
-                      <CardHeader><CardTitle className="text-base flex items-center gap-2"><Server className="h-4 w-4 text-primary" />Port Scan Results</CardTitle><CardDescription>Discovered services on {nmapResult.target || 'target'} (real nmap output)</CardDescription></CardHeader>
-                      <CardContent>
-                        {nmapResult.ports && nmapResult.ports.length > 0 ? (
-                          <div className="max-h-96 overflow-y-auto custom-scrollbar"><Table><TableHeader><TableRow><TableHead>Port</TableHead><TableHead>Protocol</TableHead><TableHead>State</TableHead><TableHead>Service</TableHead><TableHead>Version</TableHead></TableRow></TableHeader><TableBody>{nmapResult.ports.map((port, idx) => (
-                            <TableRow key={`${port.port_id}-${port.protocol}-${idx}`}><TableCell className="font-mono font-medium">{port.port_id ?? '—'}</TableCell><TableCell className="font-mono text-muted-foreground">{port.protocol || '—'}</TableCell><TableCell><Badge variant="outline" className={stateColor(port.state || '')}>{port.state || 'unknown'}</Badge></TableCell><TableCell>{port.service || 'unknown'}</TableCell><TableCell className="text-muted-foreground text-xs max-w-[200px] truncate">{port.version || 'Unknown'}</TableCell></TableRow>
-                          ))}</TableBody></Table></div>
-                        ) : (
-                          <div className="text-center py-8"><WifiOff className="h-10 w-10 text-muted-foreground/30 mx-auto mb-3" /><p className="text-sm text-muted-foreground font-medium">No ports found.</p></div>
-                        )}
+                  {/* A. Security Score Card — Hero */}
+                  <motion.div custom={0} variants={cardVariants}>
+                    <Card className={`border-2 ${scoreGradeBgColor(fullResult.securityScore.grade)}`}>
+                      <CardContent className="p-6 sm:p-8">
+                        <div className="flex flex-col lg:flex-row items-center gap-8">
+                          {/* Score Gauge */}
+                          <ScoreGauge
+                            score={fullResult.securityScore.score}
+                            grade={fullResult.securityScore.grade}
+                            label={fullResult.securityScore.label}
+                          />
+                          {/* Summary alongside gauge */}
+                          <div className="flex-1 space-y-4 text-center lg:text-left">
+                            <div>
+                              <h2 className="text-xl font-bold">Full Security Assessment</h2>
+                              <p className="text-sm text-muted-foreground mt-1">
+                                Target: <span className="font-mono text-primary">{fullResult.target}</span>
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2 justify-center lg:justify-start">
+                              <Badge variant="outline" className="text-xs bg-cyan-500/10 text-cyan-400 border-cyan-500/30"><Server className="h-3 w-3 mr-1" />Nmap</Badge>
+                              <Badge variant="outline" className="text-xs bg-purple-500/10 text-purple-400 border-purple-500/30"><Globe className="h-3 w-3 mr-1" />Nikto</Badge>
+                              <Badge variant="outline" className="text-xs bg-rose-500/10 text-rose-400 border-rose-500/30"><Bug className="h-3 w-3 mr-1" />Nuclei</Badge>
+                              <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />{fullResult.summary.enginesCompleted}/3 Engines</Badge>
+                            </div>
+                          </div>
+                        </div>
                       </CardContent>
                     </Card>
                   </motion.div>
-                  <motion.div custom={5} variants={cardVariants}>
-                    <Card>
-                      <CardHeader><CardTitle className="text-base flex items-center gap-2">{nmapVulnCount > 0 ? <AlertTriangle className="h-4 w-4 text-orange-400" /> : <CheckCircle2 className="h-4 w-4 text-emerald-400" />}Vulnerabilities</CardTitle><CardDescription>Security issues from nmap vuln scripts</CardDescription></CardHeader>
-                      <CardContent>
-                        {nmapResult.vulnerabilities && nmapResult.vulnerabilities.length > 0 ? (
-                          <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar pr-1">{nmapResult.vulnerabilities.map((vuln, idx) => (
-                            <motion.div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04, duration: 0.3 }}>
-                              <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
-                                <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3"><Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id || 'UNKNOWN-CVE'}</Badge><Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id ?? '?'}</Badge></div>
-                                <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description || 'No description available'}</p>
-                              </div>
-                            </motion.div>
-                          ))}</div>
-                        ) : (
-                          <div className="text-center py-8"><Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-sm px-4 py-1.5"><CheckCircle2 className="h-4 w-4 mr-2" />Secure — No vulnerabilities detected</Badge></div>
-                        )}
-                      </CardContent>
-                    </Card>
-                  </motion.div>
-                </>
-              )}
 
-              {/* Nikto Results */}
-              {niktoResult && (
-                <>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-                    <motion.div custom={0} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Findings</p><p className="text-3xl font-bold mt-1">{niktoFindingsCount}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><FileWarning className="h-5 w-5 text-primary" /></div></div></CardContent></Card></motion.div>
-                    <motion.div custom={1} variants={cardVariants}><Card className="border-red-500/20 bg-red-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">High</p><p className="text-3xl font-bold mt-1 text-red-400">{niktoSummary.high}</p></div><div className="h-10 w-10 rounded-lg bg-red-500/10 flex items-center justify-center"><AlertTriangle className="h-5 w-5 text-red-400" /></div></div></CardContent></Card></motion.div>
-                    <motion.div custom={2} variants={cardVariants}><Card className="border-orange-500/20 bg-orange-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Medium</p><p className="text-3xl font-bold mt-1 text-orange-400">{niktoSummary.medium}</p></div><div className="h-10 w-10 rounded-lg bg-orange-500/10 flex items-center justify-center"><AlertTriangle className="h-5 w-5 text-orange-400" /></div></div></CardContent></Card></motion.div>
-                    <motion.div custom={3} variants={cardVariants}><Card className="border-yellow-500/20 bg-yellow-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Low / Info</p><p className="text-3xl font-bold mt-1 text-yellow-400">{niktoSummary.low + niktoSummary.info}</p></div><div className="h-10 w-10 rounded-lg bg-yellow-500/10 flex items-center justify-center"><Info className="h-5 w-5 text-yellow-400" /></div></div></CardContent></Card></motion.div>
-                    <motion.div custom={4} variants={cardVariants}><Card className={niktoVulnCount > 0 ? 'border-red-500/20' : 'border-emerald-500/20'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">CVEs</p><p className={`text-3xl font-bold mt-1 ${niktoVulnCount > 0 ? 'text-red-400' : 'text-emerald-400'}`}>{niktoVulnCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${niktoVulnCount > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>{niktoVulnCount > 0 ? <Bug className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
+                  {/* B. Summary Stats Row */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    <motion.div custom={1} variants={cardVariants}>
+                      <Card className="hover:border-primary/30 transition-colors">
+                        <CardContent className="p-4 sm:p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">Open Ports</p>
+                              <p className="text-3xl font-bold mt-1">{fullResult.summary.totalOpenPorts}</p>
+                            </div>
+                            <div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center">
+                              <Server className="h-5 w-5 text-primary" />
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
+                    <motion.div custom={2} variants={cardVariants}>
+                      <Card className={fullResult.summary.totalVulnerabilities > 0 ? 'border-orange-500/30 hover:border-orange-500/50' : 'border-emerald-500/30 hover:border-emerald-500/50'}>
+                        <CardContent className="p-4 sm:p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">Vulnerabilities</p>
+                              <p className={`text-3xl font-bold mt-1 ${fullResult.summary.totalVulnerabilities > 0 ? 'text-orange-400' : 'text-emerald-400'}`}>{fullResult.summary.totalVulnerabilities}</p>
+                            </div>
+                            <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${fullResult.summary.totalVulnerabilities > 0 ? 'bg-orange-500/10' : 'bg-emerald-500/10'}`}>
+                              {fullResult.summary.totalVulnerabilities > 0 ? <AlertTriangle className="h-5 w-5 text-orange-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
+                    <motion.div custom={3} variants={cardVariants}>
+                      <Card className={fullResult.summary.totalCves > 0 ? 'border-red-500/20 bg-red-500/5' : 'border-emerald-500/20 bg-emerald-500/5'}>
+                        <CardContent className="p-4 sm:p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">Unique CVEs</p>
+                              <p className={`text-3xl font-bold mt-1 ${fullResult.summary.totalCves > 0 ? 'text-red-400' : 'text-emerald-400'}`}>{fullResult.summary.totalCves}</p>
+                            </div>
+                            <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${fullResult.summary.totalCves > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>
+                              {fullResult.summary.totalCves > 0 ? <FileWarning className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
+                    <motion.div custom={4} variants={cardVariants}>
+                      <Card className={fullResult.summary.totalWebFindings > 0 ? 'border-amber-500/20 bg-amber-500/5' : 'border-emerald-500/20 bg-emerald-500/5'}>
+                        <CardContent className="p-4 sm:p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-muted-foreground">Web Findings</p>
+                              <p className={`text-3xl font-bold mt-1 ${fullResult.summary.totalWebFindings > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>{fullResult.summary.totalWebFindings}</p>
+                            </div>
+                            <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${fullResult.summary.totalWebFindings > 0 ? 'bg-amber-500/10' : 'bg-emerald-500/10'}`}>
+                              {fullResult.summary.totalWebFindings > 0 ? <Bug className="h-5 w-5 text-amber-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
                   </div>
 
-                  {/* Nikto Findings List */}
+                  {/* C. Score Breakdown Card */}
                   <motion.div custom={5} variants={cardVariants}>
                     <Card>
                       <CardHeader>
-                        <CardTitle className="text-base flex items-center gap-2"><Globe className="h-4 w-4 text-primary" />Nikto Web Findings</CardTitle>
-                        <CardDescription>Web vulnerability findings from Nikto scan on {niktoResult.target || 'target'} {niktoResult.server && niktoResult.server !== 'Unknown' && <span>(Server: <span className="font-mono">{niktoResult.server}</span>)</span>}</CardDescription>
+                        <CardTitle className="text-base flex items-center gap-2"><Shield className="h-4 w-4 text-primary" />Security Score Breakdown</CardTitle>
+                        <CardDescription>How the security score of {fullResult.securityScore.score}/100 was calculated</CardDescription>
                       </CardHeader>
                       <CardContent>
-                        {niktoResult.findings && niktoResult.findings.length > 0 ? (
-                          <div className="space-y-3 max-h-[500px] overflow-y-auto custom-scrollbar pr-1">
-                            {niktoResult.findings.map((finding, idx) => {
-                              const isInfo = finding.description.toLowerCase().includes('suggested security header') || finding.description.toLowerCase().includes('uncommon header')
-                              const isLow = finding.description.toLowerCase().includes('outdated') || finding.description.toLowerCase().includes('mod_negotiation')
-                              const isHigh = finding.description.toLowerCase().includes('xss') || finding.description.toLowerCase().includes('sql') || finding.description.toLowerCase().includes('injection') || finding.description.toLowerCase().includes('rce') || finding.description.toLowerCase().includes('remote code')
-                              const severity = isHigh ? 'high' : (finding.references.length > 0 && !isInfo && !isLow) ? 'medium' : isLow ? 'low' : 'info'
-                              return (
-                                <motion.div key={finding.id} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.03, duration: 0.3 }}>
-                                  <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
-                                    <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
-                                      <div className="flex items-center gap-2 shrink-0">
-                                        <Badge variant="outline" className={severityColor(severity)}>{severity.toUpperCase()}</Badge>
-                                        <Badge variant="outline" className="text-xs font-mono">Port {finding.port}</Badge>
+                        <div className="overflow-x-auto">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead>Category</TableHead>
+                                <TableHead className="text-center">Count</TableHead>
+                                <TableHead className="text-center">Deduction</TableHead>
+                                <TableHead>Details</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {[
+                                { key: 'openPorts', label: 'Open Ports', icon: <Server className="h-4 w-4 text-cyan-400" /> },
+                                { key: 'vulnerabilities', label: 'Vulnerabilities', icon: <AlertTriangle className="h-4 w-4 text-orange-400" /> },
+                                { key: 'cves', label: 'Unique CVEs', icon: <FileWarning className="h-4 w-4 text-red-400" /> },
+                                { key: 'webFindings', label: 'Web Findings', icon: <Bug className="h-4 w-4 text-amber-400" /> },
+                                { key: 'nucleiCritical', label: 'Nuclei Critical', icon: <AlertTriangle className="h-4 w-4 text-red-500" /> },
+                                { key: 'nucleiHigh', label: 'Nuclei High', icon: <AlertTriangle className="h-4 w-4 text-red-400" /> },
+                              ].map(({ key, label, icon }) => {
+                                const entry = fullResult.securityScore.breakdown[key as keyof typeof fullResult.securityScore.breakdown]
+                                return (
+                                  <TableRow key={key}>
+                                    <TableCell>
+                                      <div className="flex items-center gap-2">
+                                        {icon}
+                                        <span className="font-medium">{label}</span>
                                       </div>
-                                      <div className="flex-1 min-w-0">
-                                        <div className="flex items-center gap-2 mb-1">
-                                          <span className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{finding.method}</span>
-                                          <span className="font-mono text-xs text-muted-foreground truncate">{finding.path}</span>
-                                        </div>
-                                        <p className="text-sm text-muted-foreground leading-relaxed">{finding.description}</p>
-                                        {finding.references.length > 0 && (
-                                          <div className="mt-2 flex flex-wrap gap-1.5">
-                                            {finding.references.slice(0, 3).map((ref, rIdx) => (
-                                              <a key={rIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
-                                                <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
-                                              </a>
-                                            ))}
-                                          </div>
-                                        )}
-                                      </div>
-                                    </div>
-                                  </div>
-                                </motion.div>
-                              )
-                            })}
-                          </div>
-                        ) : (
-                          <div className="text-center py-8"><Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-sm px-4 py-1.5"><CheckCircle2 className="h-4 w-4 mr-2" />Clean — No web findings</Badge></div>
-                        )}
+                                    </TableCell>
+                                    <TableCell className="text-center font-mono">{entry.count}</TableCell>
+                                    <TableCell className="text-center">
+                                      <span className={`font-mono font-semibold ${entry.deduction === 0 ? 'text-emerald-400' : 'text-orange-400'}`}>
+                                        {entry.deduction === 0 ? '0' : `-${entry.deduction}`}
+                                      </span>
+                                      {entry.deduction > 0 && <span className="text-xs text-muted-foreground ml-1">pts</span>}
+                                    </TableCell>
+                                    <TableCell className="text-sm text-muted-foreground">{entry.details}</TableCell>
+                                  </TableRow>
+                                )
+                              })}
+                              <TableRow className="border-t-2 border-border">
+                                <TableCell className="font-bold">Total Score</TableCell>
+                                <TableCell />
+                                <TableCell className="text-center font-mono font-bold">
+                                  <span className={scoreGradeColor(fullResult.securityScore.grade)}>{fullResult.securityScore.score}/100</span>
+                                </TableCell>
+                                <TableCell>
+                                  <Badge variant="outline" className={`text-sm ${scoreGradeBgColor(fullResult.securityScore.grade)} ${scoreGradeColor(fullResult.securityScore.grade)}`}>
+                                    Grade: {fullResult.securityScore.grade} — {fullResult.securityScore.label}
+                                  </Badge>
+                                </TableCell>
+                              </TableRow>
+                            </TableBody>
+                          </Table>
+                        </div>
                       </CardContent>
                     </Card>
                   </motion.div>
 
-                  {/* Nikto CVEs */}
-                  {niktoResult.vulnerabilities && niktoResult.vulnerabilities.length > 0 && (
+                  {/* D. Open Ports Table */}
+                  {fullResult.openPorts && fullResult.openPorts.length > 0 && (
                     <motion.div custom={6} variants={cardVariants}>
                       <Card>
-                        <CardHeader><CardTitle className="text-base flex items-center gap-2"><Bug className="h-4 w-4 text-red-400" />CVEs from Nikto</CardTitle><CardDescription>CVE references extracted from Nikto findings</CardDescription></CardHeader>
+                        <CardHeader>
+                          <CardTitle className="text-base flex items-center gap-2"><Server className="h-4 w-4 text-primary" />Open Ports</CardTitle>
+                          <CardDescription>All discovered open ports from nmap scan on {fullResult.target}</CardDescription>
+                        </CardHeader>
                         <CardContent>
-                          <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar pr-1">{niktoResult.vulnerabilities.map((vuln, idx) => (
-                            <motion.div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04, duration: 0.3 }}>
-                              <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
-                                <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3"><Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id}</Badge><Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id}</Badge></div>
-                                <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description}</p>
-                              </div>
-                            </motion.div>
-                          ))}</div>
+                          <div className="max-h-96 overflow-y-auto custom-scrollbar">
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead>Port</TableHead>
+                                  <TableHead>Protocol</TableHead>
+                                  <TableHead>State</TableHead>
+                                  <TableHead>Service</TableHead>
+                                  <TableHead>Version</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {fullResult.openPorts.map((port, idx) => (
+                                  <TableRow key={`${port.port_id}-${port.protocol}-${idx}`}>
+                                    <TableCell className="font-mono font-medium">{port.port_id ?? '—'}</TableCell>
+                                    <TableCell className="font-mono text-muted-foreground">{port.protocol || '—'}</TableCell>
+                                    <TableCell><Badge variant="outline" className={stateColor(port.state || '')}>{port.state || 'unknown'}</Badge></TableCell>
+                                    <TableCell>{port.service || 'unknown'}</TableCell>
+                                    <TableCell className="text-muted-foreground text-xs max-w-[200px] truncate">{port.version || 'Unknown'}</TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </div>
                         </CardContent>
+                      </Card>
+                    </motion.div>
+                  )}
+
+                  {/* E. Vulnerability Hints */}
+                  {fullResult.vulnerabilityHints && fullResult.vulnerabilityHints.length > 0 && (
+                    <motion.div custom={7} variants={cardVariants}>
+                      <Card>
+                        <CardHeader>
+                          <CardTitle className="text-base flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-orange-400" />Vulnerability Hints</CardTitle>
+                          <CardDescription>{fullResult.vulnerabilityHints.length} findings across all engines</CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                          <div className="space-y-2 max-h-[500px] overflow-y-auto custom-scrollbar pr-1">
+                            {fullResult.vulnerabilityHints.map((hint, idx) => (
+                              <motion.div key={idx} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.03, duration: 0.3 }}>
+                                <div
+                                  className="rounded-lg border border-border/50 bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer"
+                                  onClick={() => toggleHint(idx)}
+                                >
+                                  <div className="p-4">
+                                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+                                      <div className="flex items-center gap-2 shrink-0">
+                                        <Badge variant="outline" className={sourceBadgeColor(hint.source)}>{hint.source.toUpperCase()}</Badge>
+                                        <Badge variant="outline" className={severityColor(hint.severity)}>{hint.severity.toUpperCase()}</Badge>
+                                        {hint.port !== undefined && (
+                                          <Badge variant="outline" className="text-xs font-mono">Port {hint.port}</Badge>
+                                        )}
+                                      </div>
+                                      <div className="flex-1 min-w-0 flex items-center gap-2">
+                                        <span className="text-sm font-medium truncate">{hint.title}</span>
+                                        <div className="ml-auto shrink-0">
+                                          {expandedHints.has(idx) ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <AnimatePresence>
+                                      {expandedHints.has(idx) && (
+                                        <motion.div
+                                          initial={{ height: 0, opacity: 0 }}
+                                          animate={{ height: 'auto', opacity: 1 }}
+                                          exit={{ height: 0, opacity: 0 }}
+                                          transition={{ duration: 0.2 }}
+                                          className="overflow-hidden"
+                                        >
+                                          <div className="mt-3 pt-3 border-t border-border/30">
+                                            <p className="text-sm text-muted-foreground leading-relaxed">{hint.description}</p>
+                                            {hint.reference && hint.reference.length > 0 && (
+                                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                                {hint.reference.slice(0, 3).map((ref, rIdx) => (
+                                                  <a key={rIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                                    <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                                  </a>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                        </motion.div>
+                                      )}
+                                    </AnimatePresence>
+                                  </div>
+                                </div>
+                              </motion.div>
+                            ))}
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
+                  )}
+
+                  {/* F. Individual Engine Results (Collapsible) */}
+                  {/* Nmap Details */}
+                  {fullResult.nmap && (
+                    <motion.div custom={8} variants={cardVariants}>
+                      <Card>
+                        <CardHeader
+                          className="cursor-pointer select-none hover:bg-muted/30 transition-colors rounded-t-lg"
+                          onClick={() => setShowNmapDetails(!showNmapDetails)}
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <CardTitle className="text-base flex items-center gap-2">
+                                <Server className="h-4 w-4 text-cyan-400" />Nmap Details
+                              </CardTitle>
+                              <CardDescription>{fullResult.nmap.ports?.length ?? 0} ports, {fullResult.nmap.vulnerabilities?.length ?? 0} vulnerabilities</CardDescription>
+                            </div>
+                            {showNmapDetails ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
+                          </div>
+                        </CardHeader>
+                        <AnimatePresence>
+                          {showNmapDetails && (
+                            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.3 }} className="overflow-hidden">
+                              <CardContent className="space-y-4 pt-0">
+                                {fullResult.nmap.ports && fullResult.nmap.ports.length > 0 && (
+                                  <div className="max-h-96 overflow-y-auto custom-scrollbar">
+                                    <Table>
+                                      <TableHeader><TableRow><TableHead>Port</TableHead><TableHead>Protocol</TableHead><TableHead>State</TableHead><TableHead>Service</TableHead><TableHead>Version</TableHead></TableRow></TableHeader>
+                                      <TableBody>
+                                        {fullResult.nmap.ports.map((port, idx) => (
+                                          <TableRow key={`${port.port_id}-${port.protocol}-${idx}`}>
+                                            <TableCell className="font-mono font-medium">{port.port_id ?? '—'}</TableCell>
+                                            <TableCell className="font-mono text-muted-foreground">{port.protocol || '—'}</TableCell>
+                                            <TableCell><Badge variant="outline" className={stateColor(port.state || '')}>{port.state || 'unknown'}</Badge></TableCell>
+                                            <TableCell>{port.service || 'unknown'}</TableCell>
+                                            <TableCell className="text-muted-foreground text-xs max-w-[200px] truncate">{port.version || 'Unknown'}</TableCell>
+                                          </TableRow>
+                                        ))}
+                                      </TableBody>
+                                    </Table>
+                                  </div>
+                                )}
+                                {fullResult.nmap.vulnerabilities && fullResult.nmap.vulnerabilities.length > 0 && (
+                                  <div className="space-y-3">
+                                    <h4 className="text-sm font-semibold">Vulnerabilities</h4>
+                                    {fullResult.nmap.vulnerabilities.map((vuln, idx) => (
+                                      <div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+                                          <Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id || 'UNKNOWN-CVE'}</Badge>
+                                          <Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id ?? '?'}</Badge>
+                                        </div>
+                                        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description || 'No description available'}</p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </CardContent>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </Card>
+                    </motion.div>
+                  )}
+
+                  {/* Nikto Details */}
+                  {fullResult.nikto && (
+                    <motion.div custom={9} variants={cardVariants}>
+                      <Card>
+                        <CardHeader
+                          className="cursor-pointer select-none hover:bg-muted/30 transition-colors rounded-t-lg"
+                          onClick={() => setShowNiktoDetails(!showNiktoDetails)}
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <CardTitle className="text-base flex items-center gap-2">
+                                <Globe className="h-4 w-4 text-purple-400" />Nikto Details
+                              </CardTitle>
+                              <CardDescription>{fullResult.nikto.findings?.length ?? 0} findings, server: {fullResult.nikto.server || 'Unknown'}</CardDescription>
+                            </div>
+                            {showNiktoDetails ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
+                          </div>
+                        </CardHeader>
+                        <AnimatePresence>
+                          {showNiktoDetails && (
+                            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.3 }} className="overflow-hidden">
+                              <CardContent className="space-y-4 pt-0">
+                                {fullResult.nikto.findings && fullResult.nikto.findings.length > 0 && (
+                                  <div className="space-y-3 max-h-[400px] overflow-y-auto custom-scrollbar pr-1">
+                                    {fullResult.nikto.findings.map((finding, idx) => {
+                                      const isInfo = finding.description.toLowerCase().includes('suggested security header') || finding.description.toLowerCase().includes('uncommon header')
+                                      const isLow = finding.description.toLowerCase().includes('outdated') || finding.description.toLowerCase().includes('mod_negotiation')
+                                      const isHigh = finding.description.toLowerCase().includes('xss') || finding.description.toLowerCase().includes('sql') || finding.description.toLowerCase().includes('injection') || finding.description.toLowerCase().includes('rce') || finding.description.toLowerCase().includes('remote code')
+                                      const severity = isHigh ? 'high' : (finding.references.length > 0 && !isInfo && !isLow) ? 'medium' : isLow ? 'low' : 'info'
+                                      return (
+                                        <div key={finding.id} className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                          <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
+                                            <div className="flex items-center gap-2 shrink-0">
+                                              <Badge variant="outline" className={severityColor(severity)}>{severity.toUpperCase()}</Badge>
+                                              <Badge variant="outline" className="text-xs font-mono">Port {finding.port}</Badge>
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                              <div className="flex items-center gap-2 mb-1">
+                                                <span className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{finding.method}</span>
+                                                <span className="font-mono text-xs text-muted-foreground truncate">{finding.path}</span>
+                                              </div>
+                                              <p className="text-sm text-muted-foreground leading-relaxed">{finding.description}</p>
+                                              {finding.references.length > 0 && (
+                                                <div className="mt-2 flex flex-wrap gap-1.5">
+                                                  {finding.references.slice(0, 3).map((ref, rIdx) => (
+                                                    <a key={rIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                                      <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                                    </a>
+                                                  ))}
+                                                </div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                )}
+                                {fullResult.nikto.vulnerabilities && fullResult.nikto.vulnerabilities.length > 0 && (
+                                  <div className="space-y-3">
+                                    <h4 className="text-sm font-semibold">CVEs</h4>
+                                    {fullResult.nikto.vulnerabilities.map((vuln, idx) => (
+                                      <div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+                                          <Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id}</Badge>
+                                          <Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id}</Badge>
+                                        </div>
+                                        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description}</p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </CardContent>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </Card>
+                    </motion.div>
+                  )}
+
+                  {/* Nuclei Details */}
+                  {fullResult.nuclei && (
+                    <motion.div custom={10} variants={cardVariants}>
+                      <Card>
+                        <CardHeader
+                          className="cursor-pointer select-none hover:bg-muted/30 transition-colors rounded-t-lg"
+                          onClick={() => setShowNucleiDetails(!showNucleiDetails)}
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <CardTitle className="text-base flex items-center gap-2">
+                                <Bug className="h-4 w-4 text-rose-400" />Nuclei Details
+                              </CardTitle>
+                              <CardDescription>{fullResult.nuclei.findings?.length ?? 0} findings, {fullResult.nuclei.summary?.critical ?? 0} critical</CardDescription>
+                            </div>
+                            {showNucleiDetails ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
+                          </div>
+                        </CardHeader>
+                        <AnimatePresence>
+                          {showNucleiDetails && (
+                            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.3 }} className="overflow-hidden">
+                              <CardContent className="space-y-4 pt-0">
+                                {/* Nuclei Summary Stats */}
+                                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                                  {[
+                                    { label: 'Critical', value: fullResult.nuclei.summary?.critical ?? 0, color: 'text-red-500' },
+                                    { label: 'High', value: fullResult.nuclei.summary?.high ?? 0, color: 'text-red-400' },
+                                    { label: 'Medium', value: fullResult.nuclei.summary?.medium ?? 0, color: 'text-orange-400' },
+                                    { label: 'Low', value: fullResult.nuclei.summary?.low ?? 0, color: 'text-yellow-400' },
+                                    { label: 'Info', value: fullResult.nuclei.summary?.info ?? 0, color: 'text-blue-400' },
+                                    { label: 'Total', value: fullResult.nuclei.summary?.total ?? 0, color: 'text-foreground' },
+                                    { label: 'With curl', value: fullResult.nuclei.summary?.withCurlCommand ?? 0, color: 'text-emerald-400' },
+                                    { label: 'Extracted', value: fullResult.nuclei.summary?.withExtractedResults ?? 0, color: 'text-cyan-400' },
+                                  ].map(stat => (
+                                    <Card key={stat.label} className="border-border/50">
+                                      <CardContent className="p-3 text-center">
+                                        <div className={`text-2xl font-bold ${stat.color}`}>{stat.value}</div>
+                                        <div className="text-xs text-muted-foreground">{stat.label}</div>
+                                      </CardContent>
+                                    </Card>
+                                  ))}
+                                </div>
+
+                                {/* Nuclei Findings */}
+                                {['critical', 'high', 'medium', 'low', 'info'].map(sev => {
+                                  const sevFindings = (fullResult.nuclei?.findings ?? []).filter(f => f.severity === sev)
+                                  if (sevFindings.length === 0) return null
+                                  return (
+                                    <div key={sev} className="space-y-3">
+                                      <h4 className="text-sm font-semibold flex items-center gap-2">
+                                        <Badge variant="outline" className={severityColor(sev)}>{sev.toUpperCase()}</Badge>
+                                        <span className="text-muted-foreground">{sevFindings.length} finding{sevFindings.length !== 1 ? 's' : ''}</span>
+                                      </h4>
+                                      <div className="space-y-2 max-h-[400px] overflow-y-auto">
+                                        {sevFindings.map((finding, idx) => (
+                                          <Card key={`${finding.templateId}-${idx}`} className="border-border/50 hover:border-border transition-colors">
+                                            <CardContent className="p-4 space-y-3">
+                                              <div className="flex flex-col sm:flex-row sm:items-start gap-2">
+                                                <div className="flex-1 min-w-0">
+                                                  <div className="flex items-center gap-2 flex-wrap">
+                                                    <Badge variant="outline" className={severityColor(finding.severity)}>{finding.severity.toUpperCase()}</Badge>
+                                                    <Badge variant="outline" className="text-xs bg-muted/50">{finding.type.toUpperCase()}</Badge>
+                                                    <span className="font-semibold text-sm">{finding.name}</span>
+                                                  </div>
+                                                  <p className="text-xs text-muted-foreground font-mono mt-1">{finding.templateId}</p>
+                                                </div>
+                                              </div>
+                                              {finding.matchedAt && (
+                                                <div className="flex items-start gap-2">
+                                                  <ExternalLink className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
+                                                  <p className="text-sm font-mono text-primary break-all">{finding.matchedAt}</p>
+                                                </div>
+                                              )}
+                                              {finding.curlCommand && (
+                                                <div className="rounded-md bg-zinc-950 border border-zinc-800 p-3 relative group">
+                                                  <div className="flex items-center gap-1.5 mb-1.5">
+                                                    <Terminal className="h-3.5 w-3.5 text-emerald-400" />
+                                                    <span className="text-xs text-emerald-400 font-semibold">Reproduce with curl</span>
+                                                  </div>
+                                                  <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap break-all">{finding.curlCommand}</pre>
+                                                  <button
+                                                    onClick={() => copyToClipboard(finding.curlCommand!, `full-nuclei-curl-${idx}`)}
+                                                    className="absolute top-2 right-2 p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100"
+                                                    aria-label="Copy curl command"
+                                                  >
+                                                    {copiedIdx === `full-nuclei-curl-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                                                  </button>
+                                                </div>
+                                              )}
+                                              {finding.extractedResults.length > 0 && (
+                                                <div className="space-y-1.5">
+                                                  <div className="flex items-center gap-1.5">
+                                                    <Zap className="h-3.5 w-3.5 text-amber-400" />
+                                                    <span className="text-xs text-amber-400 font-semibold">Extracted Data</span>
+                                                  </div>
+                                                  <div className="flex flex-wrap gap-1.5">
+                                                    {finding.extractedResults.map((er, erIdx) => (
+                                                      <span key={erIdx} className="inline-block text-xs font-mono bg-amber-500/10 text-amber-300 border border-amber-500/30 rounded px-2 py-0.5 break-all max-w-full">{er}</span>
+                                                    ))}
+                                                  </div>
+                                                </div>
+                                              )}
+                                              {finding.tags.length > 0 && (
+                                                <div className="flex flex-wrap gap-1">
+                                                  {finding.tags.map((tag, tagIdx) => (
+                                                    <Badge key={tagIdx} variant="outline" className="text-xs bg-muted/30">{tag}</Badge>
+                                                  ))}
+                                                </div>
+                                              )}
+                                              {finding.reference.length > 0 && (
+                                                <div className="flex flex-wrap gap-1.5">
+                                                  {finding.reference.slice(0, 3).map((ref, refIdx) => (
+                                                    <a key={refIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                                      <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                                    </a>
+                                                  ))}
+                                                </div>
+                                              )}
+                                            </CardContent>
+                                          </Card>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                              </CardContent>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
                       </Card>
                     </motion.div>
                   )}
                 </>
               )}
 
-              {/* ─── Nuclei Bug Hunt Results ──────────────────────────────────────── */}
-              {nucleiResult && nucleiResult.findings.length > 0 && (
-                <motion.div variants={staggerContainer} initial="hidden" animate="visible" className="space-y-4">
-                  {/* Nuclei Summary Stats */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
-                    {[
-                      { label: 'Critical', value: nucleiSummary.critical, color: 'text-red-500' },
-                      { label: 'High', value: nucleiSummary.high, color: 'text-red-400' },
-                      { label: 'Medium', value: nucleiSummary.medium, color: 'text-orange-400' },
-                      { label: 'Low', value: nucleiSummary.low, color: 'text-yellow-400' },
-                      { label: 'Info', value: nucleiSummary.info, color: 'text-blue-400' },
-                      { label: 'Total', value: nucleiSummary.total, color: 'text-foreground' },
-                      { label: 'With curl', value: nucleiSummary.withCurlCommand, color: 'text-emerald-400' },
-                      { label: 'Extracted', value: nucleiSummary.withExtractedResults, color: 'text-cyan-400' },
-                    ].map(stat => (
-                      <motion.div key={stat.label} variants={staggerItem}>
-                        <Card className="border-border/50">
-                          <CardContent className="p-3 text-center">
-                            <div className={`text-2xl font-bold ${stat.color}`}>{stat.value}</div>
-                            <div className="text-xs text-muted-foreground">{stat.label}</div>
+              {/* ═══════════════ INDIVIDUAL ENGINE RESULTS (non-full) ═══════════════ */}
+              {!isFullResult(scanResult) && (
+                <>
+                  {/* Nmap Results */}
+                  {nmapResult && (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <motion.div custom={0} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Open Ports</p><p className="text-3xl font-bold mt-1">{openPortCount}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><Server className="h-5 w-5 text-primary" /></div></div>{(closedPortCount > 0 || filteredPortCount > 0) && <p className="text-xs text-muted-foreground mt-2">+{closedPortCount} closed, {filteredPortCount} filtered</p>}</CardContent></Card></motion.div>
+                        <motion.div custom={1} variants={cardVariants}><Card className={nmapVulnCount > 0 ? 'border-orange-500/30 hover:border-orange-500/50' : 'border-emerald-500/30 hover:border-emerald-500/50'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Vulnerabilities</p><p className={`text-3xl font-bold mt-1 ${nmapVulnCount > 0 ? 'text-orange-400' : 'text-emerald-400'}`}>{nmapVulnCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${nmapVulnCount > 0 ? 'bg-orange-500/10' : 'bg-emerald-500/10'}`}>{nmapVulnCount > 0 ? <AlertTriangle className="h-5 w-5 text-orange-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
+                        <motion.div custom={2} variants={cardVariants}><Card className={nmapCveCount > 0 ? 'border-red-500/20 bg-red-500/5' : 'border-emerald-500/20 bg-emerald-500/5'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Unique CVEs</p><p className={`text-3xl font-bold mt-1 ${nmapCveCount > 0 ? 'text-red-400' : 'text-emerald-400'}`}>{nmapCveCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${nmapCveCount > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>{nmapCveCount > 0 ? <AlertTriangle className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
+                        <motion.div custom={3} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Target</p><p className="text-lg font-semibold mt-1 font-mono truncate max-w-[180px]">{nmapResult.target || 'N/A'}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><Server className="h-5 w-5 text-primary" /></div></div><p className="text-xs text-muted-foreground mt-2">{nmapResult.ports?.length ?? 0} total ports scanned</p></CardContent></Card></motion.div>
+                      </div>
+                      <motion.div custom={4} variants={cardVariants}>
+                        <Card>
+                          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Server className="h-4 w-4 text-primary" />Port Scan Results</CardTitle><CardDescription>Discovered services on {nmapResult.target || 'target'} (real nmap output)</CardDescription></CardHeader>
+                          <CardContent>
+                            {nmapResult.ports && nmapResult.ports.length > 0 ? (
+                              <div className="max-h-96 overflow-y-auto custom-scrollbar"><Table><TableHeader><TableRow><TableHead>Port</TableHead><TableHead>Protocol</TableHead><TableHead>State</TableHead><TableHead>Service</TableHead><TableHead>Version</TableHead></TableRow></TableHeader><TableBody>{nmapResult.ports.map((port, idx) => (
+                                <TableRow key={`${port.port_id}-${port.protocol}-${idx}`}><TableCell className="font-mono font-medium">{port.port_id ?? '—'}</TableCell><TableCell className="font-mono text-muted-foreground">{port.protocol || '—'}</TableCell><TableCell><Badge variant="outline" className={stateColor(port.state || '')}>{port.state || 'unknown'}</Badge></TableCell><TableCell>{port.service || 'unknown'}</TableCell><TableCell className="text-muted-foreground text-xs max-w-[200px] truncate">{port.version || 'Unknown'}</TableCell></TableRow>
+                              ))}</TableBody></Table></div>
+                            ) : (
+                              <div className="text-center py-8"><WifiOff className="h-10 w-10 text-muted-foreground/30 mx-auto mb-3" /><p className="text-sm text-muted-foreground font-medium">No ports found.</p></div>
+                            )}
                           </CardContent>
                         </Card>
                       </motion.div>
-                    ))}
-                  </div>
-
-                  {/* Nuclei Findings List — grouped by severity */}
-                  {['critical', 'high', 'medium', 'low', 'info'].map(sev => {
-                    const sevFindings = nucleiResult.findings.filter(f => f.severity === sev)
-                    if (sevFindings.length === 0) return null
-                    return (
-                      <div key={sev} className="space-y-3">
-                        <h3 className="text-sm font-semibold flex items-center gap-2">
-                          <Badge variant="outline" className={severityColor(sev)}>{sev.toUpperCase()}</Badge>
-                          <span className="text-muted-foreground">{sevFindings.length} finding{sevFindings.length !== 1 ? 's' : ''}</span>
-                        </h3>
-                        <div className="space-y-2 max-h-[600px] overflow-y-auto">
-                          {sevFindings.map((finding, idx) => (
-                            <motion.div key={`${finding.templateId}-${idx}`} variants={staggerItem}>
-                              <Card className="border-border/50 hover:border-border transition-colors">
-                                <CardContent className="p-4 space-y-3">
-                                  {/* Finding Header */}
-                                  <div className="flex flex-col sm:flex-row sm:items-start gap-2">
-                                    <div className="flex-1 min-w-0">
-                                      <div className="flex items-center gap-2 flex-wrap">
-                                        <Badge variant="outline" className={severityColor(finding.severity)}>{finding.severity.toUpperCase()}</Badge>
-                                        <Badge variant="outline" className="text-xs bg-muted/50">{finding.type.toUpperCase()}</Badge>
-                                        <span className="font-semibold text-sm">{finding.name}</span>
-                                      </div>
-                                      <p className="text-xs text-muted-foreground font-mono mt-1">{finding.templateId}</p>
-                                    </div>
+                      <motion.div custom={5} variants={cardVariants}>
+                        <Card>
+                          <CardHeader><CardTitle className="text-base flex items-center gap-2">{nmapVulnCount > 0 ? <AlertTriangle className="h-4 w-4 text-orange-400" /> : <CheckCircle2 className="h-4 w-4 text-emerald-400" />}Vulnerabilities</CardTitle><CardDescription>Security issues from nmap vuln scripts</CardDescription></CardHeader>
+                          <CardContent>
+                            {nmapResult.vulnerabilities && nmapResult.vulnerabilities.length > 0 ? (
+                              <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar pr-1">{nmapResult.vulnerabilities.map((vuln, idx) => (
+                                <motion.div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04, duration: 0.3 }}>
+                                  <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3"><Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id || 'UNKNOWN-CVE'}</Badge><Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id ?? '?'}</Badge></div>
+                                    <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description || 'No description available'}</p>
                                   </div>
+                                </motion.div>
+                              ))}</div>
+                            ) : (
+                              <div className="text-center py-8"><Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-sm px-4 py-1.5"><CheckCircle2 className="h-4 w-4 mr-2" />Secure — No vulnerabilities detected</Badge></div>
+                            )}
+                          </CardContent>
+                        </Card>
+                      </motion.div>
+                    </>
+                  )}
 
-                                  {/* Matched At */}
-                                  {finding.matchedAt && (
-                                    <div className="flex items-start gap-2">
-                                      <ExternalLink className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
-                                      <p className="text-sm font-mono text-primary break-all">{finding.matchedAt}</p>
-                                    </div>
-                                  )}
-
-                                  {/* Curl Reproduction Command */}
-                                  {finding.curlCommand && (
-                                    <div className="rounded-md bg-zinc-950 border border-zinc-800 p-3 relative group">
-                                      <div className="flex items-center gap-1.5 mb-1.5">
-                                        <Terminal className="h-3.5 w-3.5 text-emerald-400" />
-                                        <span className="text-xs text-emerald-400 font-semibold">Reproduce with curl</span>
-                                      </div>
-                                      <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap break-all">{finding.curlCommand}</pre>
-                                      <button
-                                        onClick={() => copyToClipboard(finding.curlCommand!, `nuclei-curl-${idx}`)}
-                                        className="absolute top-2 right-2 p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100"
-                                        aria-label="Copy curl command"
-                                      >
-                                        {copiedIdx === `nuclei-curl-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-                                      </button>
-                                    </div>
-                                  )}
-
-                                  {/* Extracted Results */}
-                                  {finding.extractedResults.length > 0 && (
-                                    <div className="space-y-1.5">
-                                      <div className="flex items-center gap-1.5">
-                                        <Zap className="h-3.5 w-3.5 text-amber-400" />
-                                        <span className="text-xs text-amber-400 font-semibold">Extracted Data</span>
-                                      </div>
-                                      <div className="flex flex-wrap gap-1.5">
-                                        {finding.extractedResults.map((er, erIdx) => (
-                                          <span key={erIdx} className="inline-block text-xs font-mono bg-amber-500/10 text-amber-300 border border-amber-500/30 rounded px-2 py-0.5 break-all max-w-full">{er}</span>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {/* Tags */}
-                                  {finding.tags.length > 0 && (
-                                    <div className="flex flex-wrap gap-1">
-                                      {finding.tags.map((tag, tagIdx) => (
-                                        <Badge key={tagIdx} variant="outline" className="text-xs bg-muted/30">{tag}</Badge>
-                                      ))}
-                                    </div>
-                                  )}
-
-                                  {/* References */}
-                                  {finding.reference.length > 0 && (
-                                    <div className="flex flex-wrap gap-1.5">
-                                      {finding.reference.slice(0, 3).map((ref, refIdx) => (
-                                        <a key={refIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
-                                          <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
-                                        </a>
-                                      ))}
-                                    </div>
-                                  )}
-                                </CardContent>
-                              </Card>
-                            </motion.div>
-                          ))}
-                        </div>
+                  {/* Nikto Results */}
+                  {niktoResult && (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                        <motion.div custom={0} variants={cardVariants}><Card className="hover:border-primary/30 transition-colors"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Findings</p><p className="text-3xl font-bold mt-1">{niktoFindingsCount}</p></div><div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center"><FileWarning className="h-5 w-5 text-primary" /></div></div></CardContent></Card></motion.div>
+                        <motion.div custom={1} variants={cardVariants}><Card className="border-red-500/20 bg-red-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">High</p><p className="text-3xl font-bold mt-1 text-red-400">{niktoSummary.high}</p></div><div className="h-10 w-10 rounded-lg bg-red-500/10 flex items-center justify-center"><AlertTriangle className="h-5 w-5 text-red-400" /></div></div></CardContent></Card></motion.div>
+                        <motion.div custom={2} variants={cardVariants}><Card className="border-orange-500/20 bg-orange-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Medium</p><p className="text-3xl font-bold mt-1 text-orange-400">{niktoSummary.medium}</p></div><div className="h-10 w-10 rounded-lg bg-orange-500/10 flex items-center justify-center"><AlertTriangle className="h-5 w-5 text-orange-400" /></div></div></CardContent></Card></motion.div>
+                        <motion.div custom={3} variants={cardVariants}><Card className="border-yellow-500/20 bg-yellow-500/5"><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">Low / Info</p><p className="text-3xl font-bold mt-1 text-yellow-400">{niktoSummary.low + niktoSummary.info}</p></div><div className="h-10 w-10 rounded-lg bg-yellow-500/10 flex items-center justify-center"><Info className="h-5 w-5 text-yellow-400" /></div></div></CardContent></Card></motion.div>
+                        <motion.div custom={4} variants={cardVariants}><Card className={niktoVulnCount > 0 ? 'border-red-500/20' : 'border-emerald-500/20'}><CardContent className="p-4 sm:p-6"><div className="flex items-center justify-between"><div><p className="text-sm text-muted-foreground">CVEs</p><p className={`text-3xl font-bold mt-1 ${niktoVulnCount > 0 ? 'text-red-400' : 'text-emerald-400'}`}>{niktoVulnCount}</p></div><div className={`h-10 w-10 rounded-lg flex items-center justify-center ${niktoVulnCount > 0 ? 'bg-red-500/10' : 'bg-emerald-500/10'}`}>{niktoVulnCount > 0 ? <Bug className="h-5 w-5 text-red-400" /> : <CheckCircle2 className="h-5 w-5 text-emerald-400" />}</div></div></CardContent></Card></motion.div>
                       </div>
-                    )
-                  })}
-                </motion.div>
+
+                      {/* Nikto Findings List */}
+                      <motion.div custom={5} variants={cardVariants}>
+                        <Card>
+                          <CardHeader>
+                            <CardTitle className="text-base flex items-center gap-2"><Globe className="h-4 w-4 text-primary" />Nikto Web Findings</CardTitle>
+                            <CardDescription>Web vulnerability findings from Nikto scan on {niktoResult.target || 'target'} {niktoResult.server && niktoResult.server !== 'Unknown' && <span>(Server: <span className="font-mono">{niktoResult.server}</span>)</span>}</CardDescription>
+                          </CardHeader>
+                          <CardContent>
+                            {niktoResult.findings && niktoResult.findings.length > 0 ? (
+                              <div className="space-y-3 max-h-[500px] overflow-y-auto custom-scrollbar pr-1">
+                                {niktoResult.findings.map((finding, idx) => {
+                                  const isInfo = finding.description.toLowerCase().includes('suggested security header') || finding.description.toLowerCase().includes('uncommon header')
+                                  const isLow = finding.description.toLowerCase().includes('outdated') || finding.description.toLowerCase().includes('mod_negotiation')
+                                  const isHigh = finding.description.toLowerCase().includes('xss') || finding.description.toLowerCase().includes('sql') || finding.description.toLowerCase().includes('injection') || finding.description.toLowerCase().includes('rce') || finding.description.toLowerCase().includes('remote code')
+                                  const severity = isHigh ? 'high' : (finding.references.length > 0 && !isInfo && !isLow) ? 'medium' : isLow ? 'low' : 'info'
+                                  return (
+                                    <motion.div key={finding.id} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.03, duration: 0.3 }}>
+                                      <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                        <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
+                                          <div className="flex items-center gap-2 shrink-0">
+                                            <Badge variant="outline" className={severityColor(severity)}>{severity.toUpperCase()}</Badge>
+                                            <Badge variant="outline" className="text-xs font-mono">Port {finding.port}</Badge>
+                                          </div>
+                                          <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2 mb-1">
+                                              <span className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{finding.method}</span>
+                                              <span className="font-mono text-xs text-muted-foreground truncate">{finding.path}</span>
+                                            </div>
+                                            <p className="text-sm text-muted-foreground leading-relaxed">{finding.description}</p>
+                                            {finding.references.length > 0 && (
+                                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                                {finding.references.slice(0, 3).map((ref, rIdx) => (
+                                                  <a key={rIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                                    <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                                  </a>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </motion.div>
+                                  )
+                                })}
+                              </div>
+                            ) : (
+                              <div className="text-center py-8"><Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-sm px-4 py-1.5"><CheckCircle2 className="h-4 w-4 mr-2" />Clean — No web findings</Badge></div>
+                            )}
+                          </CardContent>
+                        </Card>
+                      </motion.div>
+
+                      {/* Nikto CVEs */}
+                      {niktoResult.vulnerabilities && niktoResult.vulnerabilities.length > 0 && (
+                        <motion.div custom={6} variants={cardVariants}>
+                          <Card>
+                            <CardHeader><CardTitle className="text-base flex items-center gap-2"><Bug className="h-4 w-4 text-red-400" />CVEs from Nikto</CardTitle><CardDescription>CVE references extracted from Nikto findings</CardDescription></CardHeader>
+                            <CardContent>
+                              <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar pr-1">{niktoResult.vulnerabilities.map((vuln, idx) => (
+                                <motion.div key={`${vuln.cve_id}-${vuln.port_id}-${idx}`} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04, duration: 0.3 }}>
+                                  <div className="rounded-lg border border-border/50 bg-muted/30 p-4 hover:bg-muted/50 transition-colors">
+                                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3"><Badge variant="destructive" className="font-mono text-xs shrink-0 w-fit">{vuln.cve_id}</Badge><Badge variant="outline" className="text-xs w-fit">Port {vuln.port_id}</Badge></div>
+                                    <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{vuln.description}</p>
+                                  </div>
+                                </motion.div>
+                              ))}</div>
+                            </CardContent>
+                          </Card>
+                        </motion.div>
+                      )}
+                    </>
+                  )}
+
+                  {/* ─── Nuclei Bug Hunt Results ──────────────────────────────────────── */}
+                  {nucleiResult && nucleiResult.findings.length > 0 && (
+                    <motion.div variants={staggerContainer} initial="hidden" animate="visible" className="space-y-4">
+                      {/* Nuclei Summary Stats */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                        {[
+                          { label: 'Critical', value: nucleiSummary.critical, color: 'text-red-500' },
+                          { label: 'High', value: nucleiSummary.high, color: 'text-red-400' },
+                          { label: 'Medium', value: nucleiSummary.medium, color: 'text-orange-400' },
+                          { label: 'Low', value: nucleiSummary.low, color: 'text-yellow-400' },
+                          { label: 'Info', value: nucleiSummary.info, color: 'text-blue-400' },
+                          { label: 'Total', value: nucleiSummary.total, color: 'text-foreground' },
+                          { label: 'With curl', value: nucleiSummary.withCurlCommand, color: 'text-emerald-400' },
+                          { label: 'Extracted', value: nucleiSummary.withExtractedResults, color: 'text-cyan-400' },
+                        ].map(stat => (
+                          <motion.div key={stat.label} variants={staggerItem}>
+                            <Card className="border-border/50">
+                              <CardContent className="p-3 text-center">
+                                <div className={`text-2xl font-bold ${stat.color}`}>{stat.value}</div>
+                                <div className="text-xs text-muted-foreground">{stat.label}</div>
+                              </CardContent>
+                            </Card>
+                          </motion.div>
+                        ))}
+                      </div>
+
+                      {/* Nuclei Findings List — grouped by severity */}
+                      {['critical', 'high', 'medium', 'low', 'info'].map(sev => {
+                        const sevFindings = nucleiResult.findings.filter(f => f.severity === sev)
+                        if (sevFindings.length === 0) return null
+                        return (
+                          <div key={sev} className="space-y-3">
+                            <h3 className="text-sm font-semibold flex items-center gap-2">
+                              <Badge variant="outline" className={severityColor(sev)}>{sev.toUpperCase()}</Badge>
+                              <span className="text-muted-foreground">{sevFindings.length} finding{sevFindings.length !== 1 ? 's' : ''}</span>
+                            </h3>
+                            <div className="space-y-2 max-h-[600px] overflow-y-auto">
+                              {sevFindings.map((finding, idx) => (
+                                <motion.div key={`${finding.templateId}-${idx}`} variants={staggerItem}>
+                                  <Card className="border-border/50 hover:border-border transition-colors">
+                                    <CardContent className="p-4 space-y-3">
+                                      {/* Finding Header */}
+                                      <div className="flex flex-col sm:flex-row sm:items-start gap-2">
+                                        <div className="flex-1 min-w-0">
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            <Badge variant="outline" className={severityColor(finding.severity)}>{finding.severity.toUpperCase()}</Badge>
+                                            <Badge variant="outline" className="text-xs bg-muted/50">{finding.type.toUpperCase()}</Badge>
+                                            <span className="font-semibold text-sm">{finding.name}</span>
+                                          </div>
+                                          <p className="text-xs text-muted-foreground font-mono mt-1">{finding.templateId}</p>
+                                        </div>
+                                      </div>
+
+                                      {/* Matched At */}
+                                      {finding.matchedAt && (
+                                        <div className="flex items-start gap-2">
+                                          <ExternalLink className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
+                                          <p className="text-sm font-mono text-primary break-all">{finding.matchedAt}</p>
+                                        </div>
+                                      )}
+
+                                      {/* Curl Reproduction Command */}
+                                      {finding.curlCommand && (
+                                        <div className="rounded-md bg-zinc-950 border border-zinc-800 p-3 relative group">
+                                          <div className="flex items-center gap-1.5 mb-1.5">
+                                            <Terminal className="h-3.5 w-3.5 text-emerald-400" />
+                                            <span className="text-xs text-emerald-400 font-semibold">Reproduce with curl</span>
+                                          </div>
+                                          <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap break-all">{finding.curlCommand}</pre>
+                                          <button
+                                            onClick={() => copyToClipboard(finding.curlCommand!, `nuclei-curl-${idx}`)}
+                                            className="absolute top-2 right-2 p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100"
+                                            aria-label="Copy curl command"
+                                          >
+                                            {copiedIdx === `nuclei-curl-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                                          </button>
+                                        </div>
+                                      )}
+
+                                      {/* Extracted Results */}
+                                      {finding.extractedResults.length > 0 && (
+                                        <div className="space-y-1.5">
+                                          <div className="flex items-center gap-1.5">
+                                            <Zap className="h-3.5 w-3.5 text-amber-400" />
+                                            <span className="text-xs text-amber-400 font-semibold">Extracted Data</span>
+                                          </div>
+                                          <div className="flex flex-wrap gap-1.5">
+                                            {finding.extractedResults.map((er, erIdx) => (
+                                              <span key={erIdx} className="inline-block text-xs font-mono bg-amber-500/10 text-amber-300 border border-amber-500/30 rounded px-2 py-0.5 break-all max-w-full">{er}</span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Tags */}
+                                      {finding.tags.length > 0 && (
+                                        <div className="flex flex-wrap gap-1">
+                                          {finding.tags.map((tag, tagIdx) => (
+                                            <Badge key={tagIdx} variant="outline" className="text-xs bg-muted/30">{tag}</Badge>
+                                          ))}
+                                        </div>
+                                      )}
+
+                                      {/* References */}
+                                      {finding.reference.length > 0 && (
+                                        <div className="flex flex-wrap gap-1.5">
+                                          {finding.reference.slice(0, 3).map((ref, refIdx) => (
+                                            <a key={refIdx} href={ref} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline flex items-center gap-1">
+                                              <ExternalLinkIcon className="h-3 w-3" />{ref.length > 50 ? ref.slice(0, 50) + '...' : ref}
+                                            </a>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </CardContent>
+                                  </Card>
+                                </motion.div>
+                              ))}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </motion.div>
+                  )}
+                </>
               )}
 
               {/* Scan Info Card */}
@@ -862,11 +1567,17 @@ export default function Home() {
                   <CardContent>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                       <div><span className="text-muted-foreground">Target:</span> <span className="font-mono">{scanResult?.target || 'N/A'}</span></div>
-                      <div><span className="text-muted-foreground">Engine:</span> <span className="font-mono">{isNucleiResult(scanResult) ? 'Nuclei (Bug Hunter)' : isNiktoResult(scanResult) ? 'Nikto (Web Scanner)' : 'Nmap (Network Scanner)'}</span></div>
+                      <div><span className="text-muted-foreground">Engine:</span> <span className="font-mono">{isFullResult(scanResult) ? 'Full Scan (Nmap + Nikto + Nuclei)' : isNucleiResult(scanResult) ? 'Nuclei (Bug Hunter)' : isNiktoResult(scanResult) ? 'Nikto (Web Scanner)' : 'Nmap (Network Scanner)'}</span></div>
                       {isNiktoResult(scanResult) && niktoResult?.server && niktoResult.server !== 'Unknown' && (
                         <div><span className="text-muted-foreground">Server:</span> <span className="font-mono">{niktoResult.server}</span></div>
                       )}
-                      {!isNiktoResult(scanResult) && !isNucleiResult(scanResult) && (
+                      {isFullResult(scanResult) && fullResult && (
+                        <>
+                          <div><span className="text-muted-foreground">Security Score:</span> <span className={`font-mono font-bold ${scoreGradeColor(fullResult.securityScore.grade)}`}>{fullResult.securityScore.score}/100 ({fullResult.securityScore.grade})</span></div>
+                          <div><span className="text-muted-foreground">Engines Completed:</span> <span className="font-mono">{fullResult.summary.enginesCompleted}/3</span></div>
+                        </>
+                      )}
+                      {!isNiktoResult(scanResult) && !isNucleiResult(scanResult) && !isFullResult(scanResult) && (
                         <>
                           <div><span className="text-muted-foreground">Ports Found:</span> <span className="font-mono">{nmapResult?.ports?.length ?? 0}</span></div>
                           <div><span className="text-muted-foreground">Open Ports:</span> <span className="font-mono text-emerald-400">{openPortCount}</span></div>
@@ -1088,7 +1799,7 @@ export default function Home() {
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2">
                             <span className="font-mono text-sm font-medium truncate">{entry.target}</span>
-                            <Badge variant="outline" className={entry.scanType === 'nikto' ? 'bg-purple-500/10 text-purple-400 border-purple-500/30 text-xs' : 'bg-primary/10 text-primary border-primary/30 text-xs'}>
+                            <Badge variant="outline" className={entry.scanType === 'full' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 text-xs' : entry.scanType === 'nikto' ? 'bg-purple-500/10 text-purple-400 border-purple-500/30 text-xs' : 'bg-primary/10 text-primary border-primary/30 text-xs'}>
                               {entry.scanType}
                             </Badge>
                             <Badge variant="outline" className={entry.status === 'completed' ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : entry.status === 'running' || entry.status === 'pending' ? 'bg-primary/20 text-primary border-primary/30' : 'bg-red-500/20 text-red-400 border-red-500/30'}>
