@@ -448,11 +448,18 @@ export default function Home() {
     setRemediationError('')
     setRemediation(null)
     try {
+      // 120s timeout — AI remediation can take time for large scans
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 120_000)
+
       const response = await fetch('/api/remediate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scanResult }),
+        signal: controller.signal,
       })
+      clearTimeout(timeoutId)
+
       if (!response.ok) {
         const errData = await response.json().catch(() => ({})) as Record<string, string>
         throw new Error(errData.error || `Remediation failed: ${response.status}`)
@@ -461,7 +468,10 @@ export default function Home() {
       setRemediation(data)
       toast({ title: 'AI Remediation Complete', description: 'Plain-English explanations and fix commands are ready' })
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Remediation engine failed'
+      const isTimeout = err instanceof DOMException && err.name === 'AbortError'
+      const msg = isTimeout
+        ? 'AI remediation timed out. The scan may have too many findings — try again.'
+        : err instanceof Error ? err.message : 'Remediation engine failed'
       setRemediationError(msg)
       toast({ title: 'Remediation Failed', description: msg, variant: 'destructive' })
     } finally {
@@ -1632,6 +1642,19 @@ export default function Home() {
                               <div className="h-3 w-5/6 bg-muted/30 rounded animate-pulse" />
                             </div>
                           ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Initial state — prompt user to generate */}
+                    {!remediation && !isRemediating && !remediationError && (
+                      <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-4">
+                        <div className="flex items-start gap-3">
+                          <Sparkles className="h-5 w-5 text-amber-400 mt-0.5 shrink-0" />
+                          <div>
+                            <p className="text-sm font-medium">AI-Powered Remediation</p>
+                            <p className="text-xs text-muted-foreground mt-1">Click "Generate AI Remediation" above to get plain-English explanations, copy-paste fix commands, and hardening recommendations for every finding.</p>
+                          </div>
                         </div>
                       </div>
                     )}

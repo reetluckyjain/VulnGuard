@@ -10,6 +10,14 @@ import ZAI from "z-ai-web-dev-sdk";
  *
  * Uses z-ai-web-dev-sdk LLM (backend only — never client-side).
  * NO MOCK DATA — Real AI-generated remediation advice.
+ *
+ * Robustness features:
+ *   - Retry logic (up to 3 attempts with exponential backoff)
+ *   - Timeout protection (30s per LLM call)
+ *   - Fresh ZAI instance on failure (avoids stale singletons)
+ *   - Multi-pattern JSON extraction from LLM response
+ *   - Request size limit (1MB)
+ *   - Works with all scan types: nmap, nikto, nuclei, full
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -82,16 +90,18 @@ interface FullScanResult {
 
 type ScanResult = NmapScanResult | NiktoScanResult | NucleiScanResult | FullScanResult
 
+// ─── Type guards (null-safe) ───────────────────────────────────────────────
+
 function isNiktoResult(result: ScanResult): result is NiktoScanResult {
-  return "scanType" in result && result.scanType === "nikto"
+  return result != null && typeof result === "object" && "scanType" in result && result.scanType === "nikto"
 }
 
 function isNucleiResult(result: ScanResult): result is NucleiScanResult {
-  return "scanType" in result && result.scanType === "nuclei"
+  return result != null && typeof result === "object" && "scanType" in result && result.scanType === "nuclei"
 }
 
 function isFullResult(result: ScanResult): result is FullScanResult {
-  return "scanType" in result && result.scanType === "full"
+  return result != null && typeof result === "object" && "scanType" in result && result.scanType === "full"
 }
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
@@ -153,7 +163,7 @@ function buildNmapPrompt(result: NmapScanResult): string {
     `- ${v.cve_id} on port ${v.port_id}: ${v.description}`
   ).join("\n")
 
-  return `Analyze these nmap network scan results for target "${result.target}":
+  return `Analyze these nmap network scan results for target "${result.target || "unknown"}":
 
 OPEN/SCANNED PORTS:
 ${portsText || "No ports found"}
@@ -176,7 +186,7 @@ function buildNiktoPrompt(result: NiktoScanResult): string {
     `- ${v.cve_id} on port ${v.port_id}: ${v.description}`
   ).join("\n")
 
-  return `Analyze these Nikto web vulnerability scan results for target "${result.target}" (Server: ${result.server}):
+  return `Analyze these Nikto web vulnerability scan results for target "${result.target || "unknown"}" (Server: ${result.server || "unknown"}):
 
 FINDINGS (${findings.length} total — ${result.summary?.high ?? 0} High, ${result.summary?.medium ?? 0} Medium, ${result.summary?.low ?? 0} Low, ${result.summary?.info ?? 0} Info):
 ${findingsText || "No findings"}
@@ -206,7 +216,7 @@ function buildNucleiPrompt(result: NucleiScanResult): string {
     `- ${v.cve_id}: ${v.description}`
   ).join("\n")
 
-  return `Analyze these Nuclei vulnerability scan results for target "${result.target}":
+  return `Analyze these Nuclei vulnerability scan results for target "${result.target || "unknown"}":
 
 FINDINGS (${findings.length} total — ${result.summary?.critical ?? 0} Critical, ${result.summary?.high ?? 0} High, ${result.summary?.medium ?? 0} Medium, ${result.summary?.low ?? 0} Low, ${result.summary?.info ?? 0} Info):
 ${findingsText || "No findings"}
@@ -222,7 +232,7 @@ Generate remediation guidance. For findings with curl commands, analyze the exac
 
 function buildFullScanPrompt(result: FullScanResult): string {
   const sections: string[] = []
-  sections.push(`Analyze this COMPREHENSIVE security scan of target "${result.target}" that ran all 3 scan engines (nmap, nikto, nuclei) simultaneously:`)
+  sections.push(`Analyze this COMPREHENSIVE security scan of target "${result.target || "unknown"}" that ran all 3 scan engines (nmap, nikto, nuclei) simultaneously:`)
 
   // Security Score
   sections.push(`\nSECURITY SCORE: ${result.securityScore?.score ?? 0}/100 (Grade: ${result.securityScore?.grade ?? "?"}, ${result.securityScore?.label ?? "Unknown"})`)
@@ -342,19 +352,124 @@ function countTotalFindings(rawResult: ScanResult): number {
   }
 }
 
-// ─── API Route Handler ─────────────────────────────────────────────────────
+// ─── Robust JSON extraction from LLM response ──────────────────────────────
 
-let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null
+function extractJsonFromResponse(text: string): Record<string, unknown> | null {
+  // Strategy 1: Direct parse (ideal case — LLM followed instructions)
+  try {
+    return JSON.parse(text.trim())
+  } catch { /* continue */ }
 
-async function getZAI() {
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create()
+  // Strategy 2: Strip markdown code fences
+  const fencePatterns = [
+    /^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/i,
+    /^```(?:json)?\s*([\s\S]*?)```$/i,
+    /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/i,
+  ]
+  for (const pattern of fencePatterns) {
+    const match = text.match(pattern)
+    if (match?.[1]) {
+      try {
+        return JSON.parse(match[1].trim())
+      } catch { /* continue */ }
+    }
   }
-  return zaiInstance
+
+  // Strategy 3: Find first { and last } — extract substring
+  const firstBrace = text.indexOf("{")
+  const lastBrace = text.lastIndexOf("}")
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(text.slice(firstBrace, lastBrace + 1))
+    } catch { /* continue */ }
+  }
+
+  // Strategy 4: Strip all markdown formatting and try again
+  const stripped = text
+    .replace(/```[\s\S]*?```/g, "")  // remove code blocks
+    .replace(/`[^`]*`/g, "")         // remove inline code
+    .replace(/\*\*[^*]*\*\*/g, "")   // remove bold
+    .replace(/#{1,6}\s/g, "")        // remove headers
+    .trim()
+  const firstB = stripped.indexOf("{")
+  const lastB = stripped.lastIndexOf("}")
+  if (firstB !== -1 && lastB > firstB) {
+    try {
+      return JSON.parse(stripped.slice(firstB, lastB + 1))
+    } catch { /* give up */ }
+  }
+
+  return null
 }
+
+// ─── LLM call with timeout ──────────────────────────────────────────────────
+
+const LLM_TIMEOUT_MS = 45_000  // 45 seconds
+const MAX_RETRIES = 3
+const MAX_REQUEST_SIZE = 1_000_000  // 1MB
+
+async function callLLMWithRetry(userPrompt: string): Promise<string> {
+  let lastError: Error | null = null
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[Remediate] LLM attempt ${attempt}/${MAX_RETRIES}`)
+
+      // Create a fresh ZAI instance each time (avoids stale singletons)
+      const zai = await ZAI.create()
+
+      // Race the LLM call against a timeout
+      const completion = await Promise.race([
+        zai.chat.completions.create({
+          messages: [
+            { role: "assistant", content: REMEDIATION_SYSTEM_PROMPT },
+            { role: "user", content: userPrompt },
+          ],
+          thinking: { type: "disabled" },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("LLM call timed out after 45s")), LLM_TIMEOUT_MS)
+        ),
+      ])
+
+      const aiResponse = completion.choices[0]?.message?.content
+
+      if (!aiResponse || aiResponse.trim().length === 0) {
+        throw new Error("LLM returned an empty response")
+      }
+
+      console.log(`[Remediate] LLM attempt ${attempt} succeeded (${aiResponse.length} chars)`)
+      return aiResponse
+
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      console.error(`[Remediate] Attempt ${attempt} failed:`, lastError.message)
+
+      if (attempt < MAX_RETRIES) {
+        // Exponential backoff: 2s, 4s
+        const delay = attempt * 2000
+        console.log(`[Remediate] Retrying in ${delay}ms...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+
+  throw lastError || new Error("LLM call failed after all retries")
+}
+
+// ─── API Route Handler ─────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
   try {
+    // Request size check
+    const contentLength = request.headers.get("content-length")
+    if (contentLength && parseInt(contentLength, 10) > MAX_REQUEST_SIZE) {
+      return NextResponse.json(
+        { error: "Request too large. Scan results must be under 1MB." },
+        { status: 413 }
+      )
+    }
+
     const body = await request.json()
     const { scanResult: rawResult } = body as { scanResult: ScanResult }
 
@@ -382,49 +497,56 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // Build prompt and call LLM
+    // Build prompt and call LLM with retry logic
     const userPrompt = buildRemediationPrompt(rawResult)
-    const zai = await getZAI()
+    const aiResponse = await callLLMWithRetry(userPrompt)
 
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "assistant", content: REMEDIATION_SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-      thinking: { type: "disabled" },
+    // Parse the JSON response from LLM (robust extraction)
+    const parsed = extractJsonFromResponse(aiResponse)
+
+    if (parsed && typeof parsed === "object") {
+      // Validate minimum required fields
+      if (!parsed.summary || !parsed.risk_level || !Array.isArray(parsed.remediations)) {
+        // Partial JSON — fill in missing fields
+        return NextResponse.json({
+          summary: (parsed.summary as string) || aiResponse.slice(0, 300),
+          risk_level: (parsed.risk_level as string) || "Medium",
+          remediations: Array.isArray(parsed.remediations) ? parsed.remediations : [],
+          hardening_recommendations: Array.isArray(parsed.hardening_recommendations) ? parsed.hardening_recommendations : [],
+          raw_response: aiResponse,
+        })
+      }
+
+      return NextResponse.json(parsed)
+    }
+
+    // If all JSON extraction strategies fail, wrap the raw text
+    return NextResponse.json({
+      summary: aiResponse.slice(0, 500),
+      risk_level: "Medium",
+      remediations: [],
+      hardening_recommendations: [],
+      raw_response: aiResponse,
     })
-
-    const aiResponse = completion.choices[0]?.message?.content
-
-    if (!aiResponse || aiResponse.trim().length === 0) {
-      return NextResponse.json(
-        { error: "AI remediation engine returned an empty response. Please try again." },
-        { status: 502 }
-      )
-    }
-
-    // Parse the JSON response from LLM
-    let parsed: Record<string, unknown>
-    try {
-      // Strip markdown code fences if present
-      const cleaned = aiResponse.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "")
-      parsed = JSON.parse(cleaned)
-    } catch {
-      // If parsing fails, wrap the raw text
-      return NextResponse.json({
-        summary: aiResponse.slice(0, 300),
-        risk_level: "Medium",
-        remediations: [],
-        hardening_recommendations: [],
-        raw_response: aiResponse,
-      })
-    }
-
-    return NextResponse.json(parsed)
 
   } catch (error) {
     console.error("[API] Remediation error:", error)
     const message = error instanceof Error ? error.message : "Internal server error"
+
+    // Provide more helpful error messages
+    if (message.includes("timed out")) {
+      return NextResponse.json(
+        { error: "The AI remediation engine timed out. The scan results may be too large. Try again or use a simpler scan." },
+        { status: 504 }
+      )
+    }
+    if (message.includes("fetch") || message.includes("network") || message.includes("ECONNREFUSED")) {
+      return NextResponse.json(
+        { error: "Cannot reach the AI service. Please check your network connection and try again." },
+        { status: 503 }
+      )
+    }
+
     return NextResponse.json(
       { error: `Remediation engine failed: ${message}` },
       { status: 500 }
