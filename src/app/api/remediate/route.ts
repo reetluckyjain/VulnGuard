@@ -422,10 +422,9 @@ async function callLLMWithRetry(userPrompt: string): Promise<string> {
       const completion = await Promise.race([
         zai.chat.completions.create({
           messages: [
-            { role: "assistant", content: REMEDIATION_SYSTEM_PROMPT },
+            { role: "system", content: REMEDIATION_SYSTEM_PROMPT },
             { role: "user", content: userPrompt },
           ],
-          thinking: { type: "disabled" },
         }),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("LLM call timed out after 45s")), LLM_TIMEOUT_MS)

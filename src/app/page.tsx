@@ -224,6 +224,7 @@ export default function Home() {
   const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([])
   const [activeScanId, setActiveScanId] = useState<string | null>(null)
   const [pollCount, setPollCount] = useState(0)
+  const [scanStartTime, setScanStartTime] = useState<number | null>(null)
   const [scanStatusText, setScanStatusText] = useState('Initializing...')
   const [remediation, setRemediation] = useState<RemediationData | null>(null)
   const [isRemediating, setIsRemediating] = useState(false)
@@ -279,6 +280,11 @@ export default function Home() {
     })
   }
 
+  const handleCancelScan = useCallback(() => {
+    setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null); setScanStartTime(null)
+    setScanStatusText('Scan cancelled')
+  }, [])
+
   const handleStartScan = useCallback(async () => {
     if (!target.trim()) { setValidationError('Please enter a target IP or hostname'); return }
     const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
@@ -296,6 +302,9 @@ export default function Home() {
     setCurrentScanTarget(target.trim())
     setCurrentScanType(scanType)
     setScanResult(null)
+    setScanStartTime(Date.now())
+    setRemediation(null)
+    setRemediationError('')
     setScanStatusText(
       scanType === 'full' ? 'Running full scan (all 3 engines)...'
         : scanType === 'nikto' ? 'Running real Nikto web scan...'
@@ -306,91 +315,114 @@ export default function Home() {
     const historyEntry: ScanHistoryEntry = { id: scanId, target: target.trim(), scanType, status: 'running', timestamp: new Date().toISOString() }
     setScanHistory(prev => [historyEntry, ...prev])
     try {
-      let response: Response | null = null
-      let lastError: string = ''
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          setScanStatusText(`Starting ${scanType} scan (attempt ${attempt}/3)...`)
-          response = await fetch('/api/scan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              target: target.trim(),
-              isAuthorized: true,
-              scanType,
-              port: (scanType === 'nikto' || scanType === 'nuclei' || scanType === 'full') ? niktoPort : undefined,
-            }),
-          })
-          if (response.ok) break
-          const contentType = response.headers.get('content-type') || ''
-          if (contentType.includes('application/json')) break
-          lastError = `Server returned ${response.status}`
-          response = null
-        } catch (fetchErr) {
-          lastError = fetchErr instanceof Error ? fetchErr.message : 'Connection failed'
-          response = null
-        }
-        if (attempt < 3) await new Promise(r => setTimeout(r, 2000))
+      // POST now executes the scan synchronously and returns results immediately
+      setScanStatusText(`Executing ${scanType} scan — this may take up to 2 minutes...`)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 180_000) // 3 min client-side timeout
+
+      const response = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: target.trim(),
+          isAuthorized: true,
+          scanType,
+          port: (scanType === 'nikto' || scanType === 'nuclei' || scanType === 'full') ? niktoPort : undefined,
+        }),
+        signal: controller.signal,
+      })
+      clearTimeout(timeoutId)
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({})) as Record<string, string>
+        throw new Error(errorData.error || `Scan failed with status ${response.status}`)
       }
 
-      if (!response || !response.ok) {
-        const errorData = response ? await response.json().catch(() => ({})) : {}
-        throw new Error((errorData as Record<string,string>).error || lastError || 'Scan request failed after 3 attempts')
-      }
       const data = await response.json() as Record<string, unknown>
       const returnedScanId = (data.scan_id as string) || scanId
-      const returnedStatus = normalizeStatus((data.status as string) || '')
-      if (data.results) {
+      const returnedStatus = ((data.status as string) || '').toLowerCase()
+
+      if (returnedStatus === 'completed' && data.results) {
+        // Scan completed synchronously — results are ready
         setScanResult(data.results as ScanResult)
-        setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null)
-        setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId, status: (returnedStatus || 'completed') as ScanHistoryEntry['status'], results: data.results as ScanResult } : e))
+        setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null); setScanStartTime(null)
+        setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId, status: 'completed' as ScanHistoryEntry['status'], results: data.results as ScanResult } : e))
         const engine = scanType === 'full' ? 'Full' : scanType === 'nikto' ? 'Nikto' : scanType === 'nuclei' ? 'Nuclei' : 'Nmap'
         toast({ title: 'Scan Complete', description: `${engine} scan of ${target.trim()} completed` })
       } else if (returnedStatus === 'failed') {
-        setIsScanning(false); setCurrentScanTarget('')
+        setIsScanning(false); setCurrentScanTarget(''); setScanStartTime(null)
         setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId, status: 'failed' as const } : e))
         toast({ title: 'Scan Failed', description: (data.error as string) || 'The scan encountered an error', variant: 'destructive' })
       } else {
+        // Still running (rare) — fall back to polling
         setActiveScanId(returnedScanId); setPollCount(0); setScanStatusText('Scan submitted — waiting for results...')
         setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, id: returnedScanId } : e))
       }
     } catch (err) {
-      setIsScanning(false); setCurrentScanTarget('')
-      toast({ title: 'Scan Failed', description: err instanceof Error ? err.message : 'Failed to start scan', variant: 'destructive' })
+      const isTimeout = err instanceof DOMException && err.name === 'AbortError'
+      setIsScanning(false); setCurrentScanTarget(''); setScanStartTime(null)
+      toast({ title: isTimeout ? 'Scan Timed Out' : 'Scan Failed', description: isTimeout ? 'The scan took too long. Try a faster scan type or check if the target is reachable.' : err instanceof Error ? err.message : 'Failed to start scan', variant: 'destructive' })
       setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, status: 'failed' as const } : e))
     }
   }, [target, isAuthorized, scanType, niktoPort])
 
+  // Elapsed time display
+  const [elapsedText, setElapsedText] = useState('')
+  useEffect(() => {
+    if (!scanStartTime || !isScanning) { setElapsedText(''); return }
+    const interval = setInterval(() => {
+      const elapsed = Math.round((Date.now() - scanStartTime) / 1000)
+      const mins = Math.floor(elapsed / 60)
+      const secs = elapsed % 60
+      setElapsedText(mins > 0 ? `${mins}m ${secs}s` : `${secs}s`)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [scanStartTime, isScanning])
+
+  // Polling fallback (for scans that don't return results immediately)
+  const MAX_POLL_COUNT = 36 // 3 minutes at 5s interval
   useEffect(() => {
     if (!activeScanId || !isScanning) return
     const pollInterval = setInterval(async () => {
       try {
+        const newPollCount = pollCount + 1
+        setPollCount(newPollCount)
+
+        // Auto-timeout after MAX_POLL_COUNT
+        if (newPollCount >= MAX_POLL_COUNT) {
+          setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null); setScanStartTime(null)
+          toast({ title: 'Scan Timed Out', description: 'The scan took too long. Try a faster scan type or check if the target is reachable.', variant: 'destructive' })
+          return
+        }
+
         const response = await fetch(`/api/scan/${activeScanId}`)
         if (!response.ok) throw new Error('Failed to fetch scan status')
         const data = await response.json() as Record<string, unknown>
-        setPollCount(prev => prev + 1)
         const statusLower = ((data.status as string) || '').toLowerCase()
         const type = (data.scan_type as string) || 'nmap'
+        const elapsed = (data.elapsed_seconds as number) || 0
+
         if (statusLower === 'pending') setScanStatusText('Scan queued — waiting for processing...')
-        else if (statusLower === 'running') setScanStatusText(`Real ${type} scan in progress — analyzing target...`)
+        else if (statusLower === 'running') setScanStatusText(`Real ${type} scan in progress (${elapsed}s elapsed)...`)
+
         if (statusLower === 'completed' && data.results) {
-          setScanResult(data.results as ScanResult); setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null)
+          setScanResult(data.results as ScanResult); setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null); setScanStartTime(null)
           setScanHistory(prev => prev.map(e => e.id === activeScanId ? { ...e, status: 'completed' as const, results: data.results as ScanResult } : e))
           toast({ title: 'Scan Complete', description: `${type} scan completed` })
         } else if (statusLower === 'failed') {
-          setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null)
+          setIsScanning(false); setCurrentScanTarget(''); setActiveScanId(null); setScanStartTime(null)
           setScanHistory(prev => prev.map(e => e.id === activeScanId ? { ...e, status: 'failed' as const } : e))
           toast({ title: 'Scan Failed', description: (data.error as string) || 'The scan encountered an error', variant: 'destructive' })
         }
       } catch { /* continue polling */ }
     }, 5000)
     return () => clearInterval(pollInterval)
-  }, [activeScanId, isScanning])
+  }, [activeScanId, isScanning, pollCount])
 
   const loadHistoryResult = (entry: ScanHistoryEntry) => {
     if (entry.results) { setScanResult(entry.results); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   }
-  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null); setRemediation(null); setRemediationError('') }
+  const handleReset = () => { setTarget(''); setIsAuthorized(false); setValidationError(''); setScanResult(null); setRemediation(null); setRemediationError(''); setScanStartTime(null) }
 
   // ─── Schedule handlers ────────────────────────────────────────────────
   const loadSchedules = useCallback(async () => {
@@ -505,7 +537,7 @@ export default function Home() {
     ? 'nikto -h target -Format csv — Web vulnerability scanner'
     : scanType === 'nuclei'
     ? 'nuclei -u target -jsonl — Template-based bug hunter'
-    : 'nmap -sT -sV --script vuln — Network/port scanner'
+    : 'nmap -sT -sV -F — Fast port scanner (top 100 ports)'
 
   // ─── Circular Score Gauge SVG ──────────────────────────────────────────
   const ScoreGauge = ({ score, grade, label }: { score: number; grade: string; label: string }) => {
@@ -639,7 +671,7 @@ export default function Home() {
                   ) : scanType === 'nuclei' ? (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nuclei -u target -jle results.jsonl</code> — Template-based bug hunter (XSS, SQLi, secrets, CVEs), 100% real data.</span>
                   ) : (
-                    <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV --script vuln</code> — Network/port scanner, 100% real data.</span>
+                    <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nmap -sT -sV -F --top-ports 100</code> — Fast port scanner, 100% real data.</span>
                   )}
                 </div>
                 {/* Engine description badge */}
@@ -740,20 +772,25 @@ export default function Home() {
                   <div className="flex items-center gap-3">
                     <div className="relative"><div className="h-3 w-3 bg-emerald-500 rounded-full animate-pulse-dot" /><div className="absolute inset-0 h-3 w-3 bg-emerald-500 rounded-full animate-ping opacity-30" /></div>
                     <span className="text-sm font-medium">Scanning <span className="font-mono text-primary">{currentScanTarget}</span> <Badge variant="outline" className="ml-1 text-xs">{currentScanType}</Badge></span>
-                    {activeScanId && <span className="text-xs text-muted-foreground ml-auto">Poll #{pollCount}</span>}
+                    {elapsedText && <span className="text-xs text-muted-foreground ml-auto flex items-center gap-1"><Clock className="h-3 w-3" />{elapsedText}</span>}
                   </div>
                   <div className="relative h-2 w-full overflow-hidden rounded-full bg-primary/10"><div className="absolute inset-0 h-full w-1/3 rounded-full bg-primary animate-indeterminate" /></div>
                   <div className="space-y-1">
                     <p className="text-sm text-muted-foreground">{scanStatusText}</p>
                     <p className="text-xs text-muted-foreground/60">
                       {currentScanType === 'full'
-                        ? 'Running all 3 scan engines in parallel — this may take 2-5 minutes.'
+                        ? 'Running all 3 scan engines in parallel — this may take 1-2 minutes.'
                         : currentScanType === 'nikto'
                         ? 'Running real Nikto web scan — this may take 1-2 minutes.'
                         : currentScanType === 'nuclei'
-                        ? 'Running real Nuclei bug hunt — this may take 2-5 minutes.'
-                        : 'Running real nmap scan — this may take 1-3 minutes.'}
+                        ? 'Running real Nuclei bug hunt — this may take 1-2 minutes.'
+                        : 'Running fast nmap scan (top 100 ports) — this may take 30-60 seconds.'}
                     </p>
+                  </div>
+                  <div className="flex justify-end">
+                    <Button variant="outline" size="sm" onClick={handleCancelScan} className="text-xs text-muted-foreground hover:text-destructive">
+                      Cancel Scan
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
