@@ -4,7 +4,7 @@ on:
   repository_dispatch:
     types: [vulnscan]
 
-timeout-minutes: 5
+timeout-minutes: 10
 
 jobs:
   vulnscan:
@@ -22,11 +22,11 @@ jobs:
       - name: Configure target URL
         run: |
           if [ "$PORT" = "443" ]; then
-            echo "TARGET_URL=https://$TARGET:$PORT" >> "$GITHUB_ENV"
+            echo "TARGET_URL=https://$TARGET" >> "$GITHUB_ENV"
           else
             echo "TARGET_URL=http://$TARGET:$PORT" >> "$GITHUB_ENV"
           fi
-          echo "Target: $TARGET | Port: $PORT | URL: $( [ "$PORT" = "443" ] && echo "https://$TARGET:$PORT" || echo "http://$TARGET:$PORT" )"
+          echo "Target: $TARGET | Port: $PORT | URL: $TARGET_URL"
 
       # ── Install scanner tools ───────────────────────────────────────────────
       - name: Install scanner tools
@@ -41,7 +41,7 @@ jobs:
           # Add Go bin to PATH for subsequent steps
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-          # Download nuclei templates (needed for scan step)
+          # Download nuclei templates
           echo "Downloading nuclei templates..."
           "$HOME/go/bin/nuclei" -update-templates
 
@@ -51,7 +51,7 @@ jobs:
       - name: Execute scan
         id: scan
         run: |
-          set +e  # Don't exit on scanner errors — we still want to send callback
+          set +e  # Don't exit on scanner errors
 
           echo "=========================================="
           echo "  VulnGuard Scan: $SCAN_TYPE"
@@ -61,10 +61,24 @@ jobs:
 
           case "$SCAN_TYPE" in
             nmap)
-              echo "::group::Nmap Scan"
-              nmap -sT -sV -F --top-ports 100 --max-retries 1 \
-                --host-timeout 30s --min-rate 100 \
+              echo "::group::Nmap Phase 1: Service version scan"
+              nmap -sT -sV --top-ports 1000 --max-retries 2 \
+                --host-timeout 60s --min-rate 100 \
                 -oX /tmp/nmap_results.xml "$TARGET"
+              echo "::endgroup::"
+
+              # Phase 2: Run vuln scripts on open ports if any found
+              echo "::group::Nmap Phase 2: Vulnerability scripts"
+              OPEN_PORTS=$(grep -oP 'portid="\K[0-9]+' /tmp/nmap_results.xml 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+              if [ -n "$OPEN_PORTS" ]; then
+                echo "Running vuln scripts on open ports: $OPEN_PORTS"
+                nmap -sT -sV --script default,vuln \
+                  -oX /tmp/nmap_vuln_results.xml \
+                  -p "$OPEN_PORTS" \
+                  --max-retries 1 --host-timeout 90s "$TARGET"
+              else
+                echo "No open ports found, skipping vuln scripts"
+              fi
               echo "::endgroup::"
               ;;
 
@@ -72,7 +86,8 @@ jobs:
               echo "::group::Nikto Scan"
               nikto -h "$TARGET:$PORT" -Format csv \
                 -o /tmp/nikto_results.csv \
-                -nointeractive -C all -maxtime 60s
+                -nointeractive -C all -maxtime 90s \
+                -Tuning 1234567890
               echo "::endgroup::"
               ;;
 
@@ -80,11 +95,14 @@ jobs:
               echo "::group::Nuclei Scan"
               nuclei -u "$TARGET_URL" \
                 -jle /tmp/nuclei_results.jsonl \
-                -silent -timeout 5 -c 10 -rl 50 -retries 1 \
+                -silent -timeout 5 -c 25 -rl 100 -retries 1 \
+                -severity low,medium,high,critical \
                 -t ~/nuclei-templates/http/cves/ \
                 -t ~/nuclei-templates/http/vulnerabilities/ \
                 -t ~/nuclei-templates/http/exposures/ \
-                -t ~/nuclei-templates/http/misconfiguration/
+                -t ~/nuclei-templates/http/misconfiguration/ \
+                -t ~/nuclei-templates/http/default-logins/ \
+                -t ~/nuclei-templates/http/exposed-panels/
               echo "::endgroup::"
               ;;
 
@@ -92,31 +110,45 @@ jobs:
               echo "::group::Full Scan (nmap + nikto + nuclei in parallel)"
 
               # Launch all three scanners as background processes
-              nmap -sT -sV -F --top-ports 100 --max-retries 1 \
-                --host-timeout 30s --min-rate 100 \
+              nmap -sT -sV --top-ports 1000 --max-retries 2 \
+                --host-timeout 60s --min-rate 100 \
                 -oX /tmp/nmap_results.xml "$TARGET" &
               NMAP_PID=$!
 
               nikto -h "$TARGET:$PORT" -Format csv \
                 -o /tmp/nikto_results.csv \
-                -nointeractive -C all -maxtime 60s &
+                -nointeractive -C all -maxtime 90s \
+                -Tuning 1234567890 &
               NIKTO_PID=$!
 
               nuclei -u "$TARGET_URL" \
                 -jle /tmp/nuclei_results.jsonl \
-                -silent -timeout 5 -c 10 -rl 50 -retries 1 \
+                -silent -timeout 5 -c 25 -rl 100 -retries 1 \
+                -severity low,medium,high,critical \
                 -t ~/nuclei-templates/http/cves/ \
                 -t ~/nuclei-templates/http/vulnerabilities/ \
                 -t ~/nuclei-templates/http/exposures/ \
-                -t ~/nuclei-templates/http/misconfiguration/ &
+                -t ~/nuclei-templates/http/misconfiguration/ \
+                -t ~/nuclei-templates/http/default-logins/ \
+                -t ~/nuclei-templates/http/exposed-panels/ &
               NUCLEI_PID=$!
 
-              # Wait for all background processes to complete
+              # Wait for all background processes
               wait "$NMAP_PID";  NMAP_EXIT=$?
               wait "$NIKTO_PID"; NIKTO_EXIT=$?
               wait "$NUCLEI_PID"; NUCLEI_EXIT=$?
 
               echo "Nmap exit: $NMAP_EXIT | Nikto exit: $NIKTO_EXIT | Nuclei exit: $NUCLEI_EXIT"
+
+              # Phase 2: nmap vuln scripts on open ports
+              OPEN_PORTS=$(grep -oP 'portid="\K[0-9]+' /tmp/nmap_results.xml 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+              if [ -n "$OPEN_PORTS" ]; then
+                echo "Running nmap vuln scripts on open ports: $OPEN_PORTS"
+                nmap -sT -sV --script default,vuln \
+                  -oX /tmp/nmap_vuln_results.xml \
+                  -p "$OPEN_PORTS" \
+                  --max-retries 1 --host-timeout 90s "$TARGET" || true
+              fi
               echo "::endgroup::"
               ;;
 
@@ -150,10 +182,16 @@ jobs:
           if scan_type in ("nmap", "full"):
               try:
                   with open("/tmp/nmap_results.xml", "r", errors="replace") as f:
-                      results["nmap"] = {"raw": f.read()}
+                      results["nmap_xml"] = f.read()
               except FileNotFoundError:
-                  if scan_type == "nmap":
-                      scan_error = scan_error or "nmap scan produced no output file"
+                  pass
+              try:
+                  with open("/tmp/nmap_vuln_results.xml", "r", errors="replace") as f:
+                      results["nmap_vuln_xml"] = f.read()
+              except FileNotFoundError:
+                  pass
+              if not results.get("nmap_xml") and scan_type == "nmap":
+                  scan_error = scan_error or "nmap scan produced no output file"
 
           # ── Collect nikto results ──
           if scan_type in ("nikto", "full"):
@@ -211,7 +249,6 @@ jobs:
 
             if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
               echo "Warning: Callback returned HTTP $HTTP_CODE"
-              echo "Response body:"
               cat /tmp/callback_response.txt 2>/dev/null || true
             fi
           else

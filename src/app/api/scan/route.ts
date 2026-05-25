@@ -2,20 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
 import { exec } from "child_process";
-import { readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, unlinkSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
 /**
  * POST /api/scan — Create and execute a new scan
  *
- * IMPORTANT ARCHITECTURE CHANGE:
- * Scans now execute SYNCHRONOUSLY with timeout protection.
+ * Architecture: Scans execute SYNCHRONOUSLY with timeout protection.
  * Results are returned immediately in the POST response.
- * No shell scripts needed — works cross-platform (Linux + Windows).
  *
  * Supports four scan types:
- *   - nmap: Fast port scanning + service version detection (NO --script vuln, too slow)
+ *   - nmap: Port scanning + service version detection + vuln scripts on open ports
  *   - nikto: Web vulnerability scanning (HTTP-level checks)
  *   - nuclei: Template-based bug hunting (XSS, SQLi, secrets, CVEs)
  *   - full: All 3 engines in parallel → unified results + security score
@@ -152,25 +150,28 @@ function ensureTmpDir() {
 
 // ─── Command Execution with Timeout ─────────────────────────────────────────
 
-function execWithTimeout(command: string, timeoutMs: number, options?: Record<string, unknown>): Promise<void> {
+function execWithTimeout(command: string, timeoutMs: number, options?: Record<string, unknown>): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const child = exec(command, { maxBuffer: 10 * 1024 * 1024, ...options }, () => {
+    const child = exec(command, { maxBuffer: 10 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
       if (!settled) {
         settled = true;
-        resolve(); // Command completed (even with non-zero exit - OK for scanner tools)
+        // For scanner tools, non-zero exit code is common (e.g., timeout, partial results)
+        // We still resolve with whatever output we got
+        resolve({ stdout: stdout || "", stderr: stderr || "" });
       }
     });
 
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
-        try { child.kill(); } catch {}
+        try { child.kill("SIGTERM"); } catch {}
+        // Give it a moment to flush output, then SIGKILL
+        setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000);
         reject(new Error(`Scan timed out after ${Math.round(timeoutMs / 1000)}s`));
       }
     }, timeoutMs);
 
-    // Handle spawn errors (e.g., command not found)
     child.on("error", (err) => {
       if (!settled) {
         settled = true;
@@ -181,85 +182,127 @@ function execWithTimeout(command: string, timeoutMs: number, options?: Record<st
   });
 }
 
-// ─── Tool Availability Check ─────────────────────────────────────────────────
-
-async function checkToolAvailable(tool: string): Promise<boolean> {
-  const isWindows = process.platform === "win32";
-  const envPath = `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`;
-  const cmd = isWindows ? `where ${tool} 2>nul` : `which ${tool} 2>/dev/null`;
-  try {
-    await execWithTimeout(cmd, 5000, {
-      env: { ...process.env, PATH: envPath, HOME: process.env.HOME || "/root" },
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // ─── Scan Timeout Constants ─────────────────────────────────────────────────
 
-const NMAP_TIMEOUT = 60_000;      // 60 seconds
-const NIKTO_TIMEOUT = 90_000;     // 90 seconds
-const NUCLEI_TIMEOUT = 90_000;    // 90 seconds
-const FULL_SCAN_TIMEOUT = 120_000; // 120 seconds
+const NMAP_TIMEOUT = 90_000;        // 90 seconds (includes vuln scripts)
+const NIKTO_TIMEOUT = 120_000;      // 120 seconds
+const NUCLEI_TIMEOUT = 90_000;      // 90 seconds (focused templates)
+const FULL_SCAN_TIMEOUT = 180_000;  // 180 seconds (all 3 engines)
+
+// ─── Environment Path Setup ─────────────────────────────────────────────────
+
+function getEnvPath(): string {
+  const homeDir = process.env.HOME || "/root";
+  const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
+  return `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
+}
+
+function getScanEnv(): Record<string, string> {
+  const homeDir = process.env.HOME || "/root";
+  return {
+    ...process.env,
+    PATH: getEnvPath(),
+    HOME: homeDir,
+  };
+}
 
 // ─── Nmap Scan Executor ─────────────────────────────────────────────────────
 
 async function runNmapScan(target: string, scanId: string): Promise<NmapScanResult> {
   ensureTmpDir();
   const xmlFile = join(TMP_DIR, `${scanId}.xml`);
+  const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
+  const env = getScanEnv();
 
-  const homeDir = process.env.HOME || "/root";
-  const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
-  const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
+  console.log(`[NmapScan] Starting scan for ${target}`);
 
-  // Fast nmap scan: service version detection on top 100 ports only
-  // NO --script vuln (too slow, causes 5-10 min hangs)
-  const cmd = `nmap -sT -sV -F --top-ports 100 --max-retries 1 --host-timeout 30s --min-rate 100 -oX "${xmlFile}" "${target}"`;
+  // Phase 1: Fast service version scan on top 1000 ports
+  const fastCmd = `nmap -sT -sV --top-ports 1000 --max-retries 2 --host-timeout 60s --min-rate 100 -oX "${xmlFile}" "${target}"`;
 
   try {
-    await execWithTimeout(cmd, NMAP_TIMEOUT, {
-      env: { ...process.env, PATH: envPath, HOME: homeDir },
-    });
-  } catch {
-    // Scan may have timed out but still produced partial output - check below
+    await execWithTimeout(fastCmd, NMAP_TIMEOUT, { env });
+    console.log(`[NmapScan] Phase 1 complete (service version scan)`);
+  } catch (e) {
+    console.warn(`[NmapScan] Phase 1 error: ${e instanceof Error ? e.message : e}`);
   }
 
-  // Parse output if available
-  if (existsSync(xmlFile)) {
-    try {
-      const xml = readFileSync(xmlFile, "utf-8");
-      if (xml.includes("</nmaprun>")) {
-        const result = parseNmapXml(target, xml);
-        try { unlinkSync(xmlFile); } catch {}
-        return result;
-      }
-    } catch {}
-  }
-
-  // Fallback: basic scan without -sV (faster, less info)
-  const fallbackCmd = `nmap -sT -F --top-ports 100 --max-retries 1 --host-timeout 30s --min-rate 100 -oX "${xmlFile}" "${target}"`;
-  try {
-    await execWithTimeout(fallbackCmd, NMAP_TIMEOUT / 2, {
-      env: { ...process.env, PATH: envPath, HOME: homeDir },
-    });
-  } catch {}
+  // Parse phase 1 results
+  let result: NmapScanResult = { target, ports: [], vulnerabilities: [] };
 
   if (existsSync(xmlFile)) {
     try {
       const xml = readFileSync(xmlFile, "utf-8");
       if (xml.includes("</nmaprun>")) {
-        const result = parseNmapXml(target, xml);
-        try { unlinkSync(xmlFile); } catch {}
-        return result;
+        result = parseNmapXml(target, xml);
+        console.log(`[NmapScan] Phase 1 parsed: ${result.ports.length} ports, ${result.vulnerabilities.length} vulns`);
       }
-    } catch {}
+    } catch (e) {
+      console.warn(`[NmapScan] Phase 1 parse error:`, e);
+    }
   }
 
-  // No output at all
+  // Phase 2: If open ports found, run vuln scripts on them for CVE detection
+  const openPorts = result.ports.filter(p => p.state.toLowerCase() === "open");
+  if (openPorts.length > 0) {
+    const portList = openPorts.map(p => p.port_id).join(",");
+    console.log(`[NmapScan] Phase 2: Running vuln scripts on open ports: ${portList}`);
+
+    const vulnCmd = `nmap -sT -sV --script default,vuln -oX "${vulnXmlFile}" -p ${portList} --max-retries 1 --host-timeout 90s "${target}"`;
+
+    try {
+      await execWithTimeout(vulnCmd, NMAP_TIMEOUT, { env });
+      console.log(`[NmapScan] Phase 2 complete (vuln scripts)`);
+    } catch (e) {
+      console.warn(`[NmapScan] Phase 2 error: ${e instanceof Error ? e.message : e}`);
+    }
+
+    // Parse phase 2 results (merge with phase 1)
+    if (existsSync(vulnXmlFile)) {
+      try {
+        const vulnXml = readFileSync(vulnXmlFile, "utf-8");
+        if (vulnXml.includes("</nmaprun>")) {
+          const vulnResult = parseNmapXml(target, vulnXml);
+
+          // Merge vulnerabilities from vuln scan
+          if (vulnResult.vulnerabilities.length > 0) {
+            const existingCves = new Set(result.vulnerabilities.map(v => v.cve_id));
+            for (const v of vulnResult.vulnerabilities) {
+              if (!existingCves.has(v.cve_id)) {
+                result.vulnerabilities.push(v);
+                existingCves.add(v.cve_id);
+              }
+            }
+            console.log(`[NmapScan] Phase 2 found ${vulnResult.vulnerabilities.length} additional vulns`);
+          }
+
+          // Merge any additional port info from vuln scan
+          const existingPortIds = new Set(result.ports.map(p => p.port_id));
+          for (const p of vulnResult.ports) {
+            if (!existingPortIds.has(p.port_id)) {
+              result.ports.push(p);
+              existingPortIds.add(p.port_id);
+            } else {
+              // Update existing port with more detailed info if available
+              const existing = result.ports.find(ep => ep.port_id === p.port_id);
+              if (existing && existing.version === "Unknown" && p.version !== "Unknown") {
+                existing.version = p.version;
+                existing.service = p.service;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[NmapScan] Phase 2 parse error:`, e);
+      }
+    }
+  }
+
+  // Clean up temp files
   try { unlinkSync(xmlFile); } catch {}
-  return { target, ports: [], vulnerabilities: [] };
+  try { unlinkSync(vulnXmlFile); } catch {}
+
+  console.log(`[NmapScan] Final result: ${result.ports.length} ports (${openPorts.length} open), ${result.vulnerabilities.length} vulns`);
+  return result;
 }
 
 // ─── Nikto Scan Executor ────────────────────────────────────────────────────
@@ -267,21 +310,27 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
 async function runNiktoScan(target: string, port: string, scanId: string): Promise<NiktoScanResult> {
   ensureTmpDir();
   const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
-
-  const homeDir = process.env.HOME || "/root";
-  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
+  const env = getScanEnv();
 
   // Build nikto URL
   const niktoTarget = `http${port === "443" ? "s" : ""}://${target}:${port}`;
 
-  const cmd = `nikto -h "${niktoTarget}" -Format csv -o "${csvFile}" -nointeractive -C all -maxtime 60s`;
+  // Nikto with extended timeout for thorough scanning
+  const cmd = `nikto -h "${niktoTarget}" -Format csv -o "${csvFile}" -nointeractive -C all -maxtime 90s -Tuning 1234567890`;
+
+  console.log(`[NiktoScan] Starting scan for ${niktoTarget}`);
 
   try {
     await execWithTimeout(cmd, NIKTO_TIMEOUT, {
-      env: { ...process.env, PATH: envPath, HOME: homeDir, NIKTODIR: `${homeDir}/nikto/program`, PERL5LIB: `${homeDir}/nikto/program` },
+      env: {
+        ...env,
+        NIKTODIR: `${process.env.HOME || "/root"}/nikto/program`,
+        PERL5LIB: `${process.env.HOME || "/root"}/nikto/program`,
+      },
     });
-  } catch {
-    // May have timed out but still produced output
+    console.log(`[NiktoScan] Scan complete`);
+  } catch (e) {
+    console.warn(`[NiktoScan] Scan error: ${e instanceof Error ? e.message : e}`);
   }
 
   if (existsSync(csvFile)) {
@@ -290,12 +339,16 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
       if (csv.trim().length > 0) {
         const result = parseNiktoCsv(target, csv);
         try { unlinkSync(csvFile); } catch {}
+        console.log(`[NiktoScan] Parsed: ${result.findings.length} findings, ${result.vulnerabilities.length} vulns`);
         return result;
       }
-    } catch {}
+    } catch (e) {
+      console.warn(`[NiktoScan] Parse error:`, e);
+    }
   }
 
   try { unlinkSync(csvFile); } catch {}
+  console.log(`[NiktoScan] No results found`);
   return { target, scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
 }
 
@@ -304,12 +357,8 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
 async function runNucleiScan(target: string, port: string, scanId: string): Promise<NucleiScanResult> {
   ensureTmpDir();
   const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
-
-  const homeDir = process.env.HOME || "/root";
-  // Include Go bin path for nuclei installed via `go install`
-  const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
-  const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
-  const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${homeDir}/nuclei-templates`;
+  const env = getScanEnv();
+  const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${process.env.HOME || "/root"}/nuclei-templates`;
 
   // Build target URL
   let scanUrl: string;
@@ -323,33 +372,44 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
     scanUrl = `http://${target}`;
   }
 
-  // Use limited templates for speed (don't scan ALL templates)
-  // Nuclei v3.8.0 compatible — installed via `go install`
-  const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -timeout 5 -c 10 -rl 50 -retries 1 -t "${templatesDir}/http/cves/" -t "${templatesDir}/http/vulnerabilities/" -t "${templatesDir}/http/exposures/" -t "${templatesDir}/http/misconfiguration/"`;
+  // Check which template directories exist
+  const templateDirs = [
+    "http/cves/",
+    "http/vulnerabilities/",
+    "http/exposures/",
+    "http/misconfiguration/",
+    "http/default-logins/",
+    "http/exposed-panels/",
+  ].filter(dir => existsSync(join(templatesDir, dir)));
+
+  const templateArgs = templateDirs.map(d => `-t "${join(templatesDir, d)}"`).join(" ");
+
+  // Focused scan: only medium/high/critical severity, reasonable concurrency
+  const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -timeout 5 -c 25 -rl 100 -retries 1 -severity low,medium,high,critical ${templateArgs}`;
+
+  console.log(`[NucleiScan] Starting scan for ${scanUrl} with ${templateDirs.length} template dirs`);
 
   try {
-    await execWithTimeout(cmd, NUCLEI_TIMEOUT, {
-      env: { ...process.env, PATH: envPath, HOME: homeDir, NUCLEI_TEMPLATES_DIR: templatesDir },
-    });
-  } catch {
-    // May have timed out but still produced output
+    await execWithTimeout(cmd, NUCLEI_TIMEOUT, { env });
+    console.log(`[NucleiScan] Scan complete`);
+  } catch (e) {
+    console.warn(`[NucleiScan] Scan error: ${e instanceof Error ? e.message : e}`);
   }
 
-  // Nuclei: no findings = empty JSONL = valid result
+  // Parse results
   if (!existsSync(jsonlFile)) {
-    // Create empty file so parsing doesn't fail
-    try { mkdirSync(TMP_DIR, { recursive: true }); } catch {}
-    const { writeFileSync } = await import("fs");
-    writeFileSync(jsonlFile, "");
+    try { mkdirSync(TMP_DIR, { recursive: true }); writeFileSync(jsonlFile, ""); } catch {}
   }
 
   try {
     const jsonl = readFileSync(jsonlFile, "utf-8");
     const result = parseNucleiJsonl(target, jsonl);
     try { unlinkSync(jsonlFile); } catch {}
+    console.log(`[NucleiScan] Parsed: ${result.findings.length} findings, ${result.vulnerabilities.length} vulns`);
     return result;
   } catch {
     try { unlinkSync(jsonlFile); } catch {}
+    console.log(`[NucleiScan] No results found`);
     return {
       target, scanType: "nuclei", findings: [], vulnerabilities: [],
       summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
@@ -360,6 +420,8 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
 // ─── Full Scan Executor ─────────────────────────────────────────────────────
 
 async function runFullScan(target: string, port: string, scanId: string): Promise<FullScanResult> {
+  console.log(`[FullScan] Starting full scan for ${target}`);
+
   // Run all 3 engines in parallel
   const [nmapSettled, niktoSettled, nucleiSettled] = await Promise.allSettled([
     runNmapScan(target, `${scanId}-nmap`),
@@ -370,6 +432,8 @@ async function runFullScan(target: string, port: string, scanId: string): Promis
   const nmapResult = nmapSettled.status === "fulfilled" ? nmapSettled.value : null;
   const niktoResult = niktoSettled.status === "fulfilled" ? niktoSettled.value : null;
   const nucleiResult = nucleiSettled.status === "fulfilled" ? nucleiSettled.value : null;
+
+  console.log(`[FullScan] Engines completed: nmap=${!!nmapResult}, nikto=${!!niktoResult}, nuclei=${!!nucleiResult}`);
 
   // Build unified result
   const securityScore = calculateSecurityScore(nmapResult, niktoResult, nucleiResult);
@@ -451,6 +515,7 @@ function parseNmapXml(target: string, xml: string): NmapScanResult {
 
     ports.push({ port_id: portId, protocol, state, service: serviceName, version: versionStr });
 
+    // Parse script output for CVEs (handles both compact and verbose XML formats)
     const scriptRegex = /<script\s+id="([^"]*)"\s+output="([^"]*)"([\s\S]*?)<\/script>/g;
     let scriptMatch;
     while ((scriptMatch = scriptRegex.exec(portBlock)) !== null) {
@@ -458,11 +523,21 @@ function parseNmapXml(target: string, xml: string): NmapScanResult {
       const scriptOutput = scriptMatch[2].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"');
       const scriptBody = scriptMatch[3];
       const textParts: string[] = [scriptOutput];
+
+      // Collect all text content from nested elements
       const elemRegex = /<elem[^>]*>([\s\S]*?)<\/elem>/g;
       let elemMatch;
       while ((elemMatch = elemRegex.exec(scriptBody)) !== null) {
         if (elemMatch[1]) textParts.push(elemMatch[1].trim());
       }
+
+      // Also collect from table/elem structures
+      const tableElemRegex = /<elem[^>]*key="([^"]*)"[^>]*>([\s\S]*?)<\/elem>/g;
+      let tableElemMatch;
+      while ((tableElemMatch = tableElemRegex.exec(scriptBody)) !== null) {
+        if (tableElemMatch[2]) textParts.push(`${tableElemMatch[1]}: ${tableElemMatch[2].trim()}`);
+      }
+
       const combinedText = textParts.join(" ");
       CVE_REGEX.lastIndex = 0;
       const cveMatches = combinedText.match(CVE_REGEX);
@@ -476,7 +551,16 @@ function parseNmapXml(target: string, xml: string): NmapScanResult {
         }
       }
     }
+
+    // Also check for CPE data which indicates known vulnerabilities
+    const cpeRegex = /<cpe>([^<]+)<\/cpe>/g;
+    let cpeMatch;
+    while ((cpeMatch = cpeRegex.exec(portBlock)) !== null) {
+      // CPE itself is not a CVE, but we note it for context
+      // The vuln scripts will find the actual CVEs
+    }
   }
+
   return { target, ports, vulnerabilities };
 }
 
@@ -490,6 +574,7 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
   const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
 
   for (const line of lines) {
+    // Parse CSV with proper quote handling
     const fields: string[] = [];
     let current = "";
     let inQuotes = false;
@@ -511,75 +596,93 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
     }
     fields.push(current);
 
+    // Skip header/empty lines
     if (fields.length <= 1 && fields[0]?.startsWith("Nikto")) continue;
+    if (fields.length < 7) continue;
 
-    if (fields.length >= 7) {
-      const [host, ip, portStr, references, method, path, description] = fields;
+    const [host, ip, portStr, references, method, path, description] = fields;
 
-      if (description?.includes("appears to be outdated") || description?.includes("Server:")) {
-        const serverMatch = description.match(/(?:Server:\s*|^)([A-Za-z][^\s.]+)/);
-        if (serverMatch) server = serverMatch[1];
-      }
+    // Extract server info
+    if (description?.includes("appears to be outdated") || description?.includes("Server:")) {
+      const serverMatch = description.match(/(?:Server:\s*|^)([A-Za-z][^\s.]+)/);
+      if (serverMatch) server = serverMatch[1];
+    }
+    // Also extract from "Server:" header findings
+    if (host?.includes("Server:") || description?.includes("Server:")) {
+      const serverMatch = (host + " " + description).match(/Server:\s*([^\s,]+)/);
+      if (serverMatch) server = serverMatch[1];
+    }
 
-      const port = parseInt(portStr, 10) || 80;
+    const port = parseInt(portStr, 10) || 80;
 
-      const finding: NiktoFinding = {
-        id: `nikto-${findings.length + 1}`,
-        host: host || target,
-        ip: ip || "",
-        port,
-        method: method || "GET",
-        path: path || "/",
-        description: description || "",
-        references: references ? references.split(",").map(r => r.trim()).filter(Boolean) : [],
-      };
-      findings.push(finding);
+    // Skip truly empty findings
+    if (!description || description.trim().length === 0) continue;
 
-      CVE_REGEX.lastIndex = 0;
-      const allText = `${references} ${description}`;
-      const cveMatches = allText.match(CVE_REGEX);
-      if (cveMatches) {
-        const seen = new Set<string>();
-        for (const cveId of cveMatches) {
-          if (!seen.has(cveId)) {
-            seen.add(cveId);
-            const idx = allText.indexOf(cveId);
-            const start = Math.max(0, idx - 60);
-            const end = Math.min(allText.length, idx + cveId.length + 150);
-            let snippet = allText.slice(start, end).trim().replace(/\s+/g, " ");
-            if (snippet.length < 15) snippet = `${cveId} detected by Nikto on port ${port}`;
-            vulnerabilities.push({
-              port_id: port,
-              cve_id: cveId,
-              description: snippet.slice(0, 400),
-            });
-          }
+    const finding: NiktoFinding = {
+      id: `nikto-${findings.length + 1}`,
+      host: host || target,
+      ip: ip || "",
+      port,
+      method: method || "GET",
+      path: path || "/",
+      description: description || "",
+      references: references ? references.split(",").map(r => r.trim()).filter(Boolean) : [],
+    };
+    findings.push(finding);
+
+    // Extract CVEs from references and description
+    CVE_REGEX.lastIndex = 0;
+    const allText = `${references} ${description}`;
+    const cveMatches = allText.match(CVE_REGEX);
+    if (cveMatches) {
+      const seen = new Set<string>();
+      for (const cveId of cveMatches) {
+        if (!seen.has(cveId)) {
+          seen.add(cveId);
+          const idx = allText.indexOf(cveId);
+          const start = Math.max(0, idx - 60);
+          const end = Math.min(allText.length, idx + cveId.length + 150);
+          let snippet = allText.slice(start, end).trim().replace(/\s+/g, " ");
+          if (snippet.length < 15) snippet = `${cveId} detected by Nikto on port ${port}`;
+          vulnerabilities.push({
+            port_id: port,
+            cve_id: cveId,
+            description: snippet.slice(0, 400),
+          });
         }
       }
     }
   }
 
+  // Classify findings by severity
   const summary = {
     total: findings.length,
     info: findings.filter(f =>
       f.description.toLowerCase().includes("suggested security header") ||
-      f.description.toLowerCase().includes("uncommon header")
+      f.description.toLowerCase().includes("uncommon header") ||
+      f.description.toLowerCase().includes("server:") ||
+      f.description.toLowerCase().includes("x-powered-by")
     ).length,
     low: findings.filter(f =>
       f.description.toLowerCase().includes("outdated") ||
-      f.description.toLowerCase().includes("mod_negotiation")
+      f.description.toLowerCase().includes("mod_negotiation") ||
+      f.description.toLowerCase().includes("directory indexing")
     ).length,
     medium: findings.filter(f =>
       f.references.length > 0 &&
       !f.description.toLowerCase().includes("suggested security header") &&
-      !f.description.toLowerCase().includes("uncommon header")
+      !f.description.toLowerCase().includes("uncommon header") &&
+      !f.description.toLowerCase().includes("server:") &&
+      !f.description.toLowerCase().includes("x-powered-by")
     ).length,
     high: findings.filter(f =>
       f.description.toLowerCase().includes("xss") ||
       f.description.toLowerCase().includes("sql") ||
       f.description.toLowerCase().includes("injection") ||
       f.description.toLowerCase().includes("rce") ||
-      f.description.toLowerCase().includes("remote code")
+      f.description.toLowerCase().includes("remote code") ||
+      f.description.toLowerCase().includes("csrf") ||
+      f.description.toLowerCase().includes("traversal")
     ).length,
   };
 
@@ -596,6 +699,9 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
   for (const line of lines) {
     try {
       const obj = JSON.parse(line) as Record<string, unknown>;
+
+      // Skip non-result lines (info, warnings etc)
+      if (obj.type === "templates" || obj.type === "error") continue;
 
       const info = (obj.info as Record<string, unknown>) || {};
 
@@ -645,6 +751,7 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
         timestamp,
       });
 
+      // Extract CVEs from template ID, tags, and name
       const cveText = `${templateId} ${tags.join(" ")} ${name}`;
       CVE_REGEX.lastIndex = 0;
       const cveMatches = cveText.match(CVE_REGEX);
@@ -790,6 +897,7 @@ function buildVulnerabilityHints(
         port: v.port_id,
       });
     }
+    // Flag potentially outdated services
     for (const p of nmapResult.ports) {
       if (p.state.toLowerCase() === "open" && p.version !== "Unknown") {
         const outdatedKeywords = ["old", "outdated", "2.4.7", "6.6.1", "1.1.1"];
@@ -802,6 +910,31 @@ function buildVulnerabilityHints(
             port: p.port_id,
           });
         }
+      }
+    }
+    // Flag high-risk open ports
+    const highRiskPorts: Record<number, string> = {
+      23: "Telnet (unencrypted remote access)",
+      21: "FTP (unencrypted file transfer)",
+      25: "SMTP (mail relay, often misconfigured)",
+      445: "SMB (Windows file sharing, frequently exploited)",
+      3389: "RDP (Remote Desktop, frequently targeted)",
+      5900: "VNC (remote desktop, often misconfigured)",
+      5432: "PostgreSQL (database exposed to network)",
+      27017: "MongoDB (database, often unauthenticated)",
+      6379: "Redis (often deployed without auth)",
+      9200: "Elasticsearch (often misconfigured)",
+    };
+    const openPorts = nmapResult.ports.filter(p => p.state.toLowerCase() === "open");
+    for (const p of openPorts) {
+      if (highRiskPorts[p.port_id]) {
+        hints.push({
+          source: "nmap",
+          severity: "high",
+          title: `High-risk port open: ${p.port_id} (${p.service})`,
+          description: highRiskPorts[p.port_id],
+          port: p.port_id,
+        });
       }
     }
   }
@@ -857,432 +990,205 @@ function resolveScanType(scanType: string): "nmap" | "nikto" | "nuclei" | "full"
 // ─── Result Processor (for backward compatibility with polling GET route) ────
 
 export async function processScanResults(scanId: string, scanType: string): Promise<{ status: string; results: ScanResultType | null; error: string | null }> {
-  const statusFile = join(TMP_DIR, `${scanId}.status`);
+  // This is kept for backward compatibility with the GET polling route
+  // but since scans now run synchronously, this mainly checks the DB
+  try {
+    const scan = await db.scan.findUnique({ where: { id: scanId } });
+    if (!scan) return { status: "Unknown", results: null, error: null };
 
-  if (existsSync(statusFile)) {
-    const status = readFileSync(statusFile, "utf-8").trim();
-    if (status.startsWith("error:")) {
-      return { status: "Failed", results: null, error: status.slice(6) };
-    }
-    if (status === "completed") {
-      // Full Scan
-      if (scanType === "full") {
-        let nmapResult: NmapScanResult | null = null;
-        let niktoResult: NiktoScanResult | null = null;
-        let nucleiResult: NucleiScanResult | null = null;
-
-        const nmapXml = join(TMP_DIR, `${scanId}-nmap.xml`);
-        const nmapVulnXml = join(TMP_DIR, `${scanId}-nmap-vuln.xml`);
-        if (existsSync(nmapXml)) {
-          try {
-            const xml = readFileSync(nmapXml, "utf-8");
-            if (xml.includes("</nmaprun>")) {
-              nmapResult = parseNmapXml("", xml);
-            }
-          } catch {}
-        }
-        if (nmapResult && existsSync(nmapVulnXml)) {
-          try {
-            const vulnXml = readFileSync(nmapVulnXml, "utf-8");
-            if (vulnXml.includes("</nmaprun>")) {
-              const vulnParsed = parseNmapXml("", vulnXml);
-              if (vulnParsed.vulnerabilities.length > 0) {
-                nmapResult.vulnerabilities = vulnParsed.vulnerabilities;
-              }
-              const existingPorts = new Set(nmapResult.ports.map(p => p.port_id));
-              for (const p of vulnParsed.ports) {
-                if (!existingPorts.has(p.port_id)) {
-                  nmapResult.ports.push(p);
-                  existingPorts.add(p.port_id);
-                }
-              }
-            }
-          } catch {}
-        }
-
-        const niktoCsv = join(TMP_DIR, `${scanId}-nikto-nikto.csv`);
-        if (existsSync(niktoCsv)) {
-          try {
-            const csv = readFileSync(niktoCsv, "utf-8");
-            if (csv.trim().length > 0) {
-              niktoResult = parseNiktoCsv("", csv);
-            }
-          } catch {}
-        }
-
-        const nucleiJsonl = join(TMP_DIR, `${scanId}-nuclei-nuclei.jsonl`);
-        if (existsSync(nucleiJsonl)) {
-          try {
-            const jsonl = readFileSync(nucleiJsonl, "utf-8");
-            if (jsonl.trim().length > 0) {
-              nucleiResult = parseNucleiJsonl("", jsonl);
-            }
-          } catch {}
-        }
-
-        const securityScore = calculateSecurityScore(nmapResult, niktoResult, nucleiResult);
-        const vulnerabilityHints = buildVulnerabilityHints(nmapResult, niktoResult, nucleiResult);
-        const openPorts = nmapResult?.ports.filter(p => p.state.toLowerCase() === "open") || [];
-
-        const allCves = new Set<string>();
-        if (nmapResult) nmapResult.vulnerabilities.forEach(v => allCves.add(v.cve_id));
-        if (niktoResult) niktoResult.vulnerabilities.forEach(v => allCves.add(v.cve_id));
-        if (nucleiResult) nucleiResult.vulnerabilities.forEach(v => allCves.add(v.cve_id));
-
-        const totalVulns = (nmapResult?.vulnerabilities.length || 0) +
-          (niktoResult?.vulnerabilities.length || 0) +
-          (nucleiResult?.vulnerabilities.length || 0);
-
-        const fullResult: FullScanResult = {
-          target: nmapResult?.target || niktoResult?.target || nucleiResult?.target || "",
-          scanType: "full",
-          nmap: nmapResult,
-          nikto: niktoResult,
-          nuclei: nucleiResult,
-          securityScore,
-          openPorts,
-          vulnerabilityHints,
-          summary: {
-            totalOpenPorts: openPorts.length,
-            totalVulnerabilities: totalVulns,
-            totalCves: allCves.size,
-            totalWebFindings: (niktoResult?.findings.length || 0) + (nucleiResult?.findings.length || 0),
-            enginesCompleted: (nmapResult ? 1 : 0) + (niktoResult ? 1 : 0) + (nucleiResult ? 1 : 0),
-          },
-        };
-
-        try {
-          await db.scan.update({
-            where: { id: scanId },
-            data: { status: "Completed", results: JSON.stringify(fullResult) },
-          });
-        } catch {}
-
-        [nmapXml, nmapVulnXml, niktoCsv, nucleiJsonl, statusFile,
-          join(TMP_DIR, `${scanId}-full.counter`),
-          join(TMP_DIR, `${scanId}-nmap.status`),
-          join(TMP_DIR, `${scanId}-nikto.status`),
-          join(TMP_DIR, `${scanId}-nuclei.status`),
-        ].forEach(f => { try { unlinkSync(f); } catch {} });
-
-        return { status: "Completed", results: fullResult, error: null };
-      }
-
-      if (scanType === "nuclei") {
-        const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
-        let result: NucleiScanResult = {
-          target: "", scanType: "nuclei",
-          findings: [], vulnerabilities: [],
-          summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
-        };
-
-        if (existsSync(jsonlFile)) {
-          try {
-            const jsonl = readFileSync(jsonlFile, "utf-8");
-            if (jsonl.trim().length > 0) {
-              result = parseNucleiJsonl("", jsonl);
-            }
-          } catch (err) {
-            console.error("[API] Error parsing Nuclei JSONL:", err);
-          }
-        }
-
-        try {
-          await db.scan.update({
-            where: { id: scanId },
-            data: { status: "Completed", results: JSON.stringify(result) },
-          });
-        } catch {}
-
-        try { unlinkSync(jsonlFile); } catch {}
-        try { unlinkSync(statusFile); } catch {}
-
-        return { status: "Completed", results: result, error: null };
-
-      } else if (scanType === "nikto") {
-        const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
-        let result: NiktoScanResult = { target: "", scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
-
-        if (existsSync(csvFile)) {
-          try {
-            const csv = readFileSync(csvFile, "utf-8");
-            if (csv.trim().length > 0) {
-              result = parseNiktoCsv("", csv);
-            }
-          } catch (err) {
-            console.error("[API] Error parsing Nikto CSV:", err);
-          }
-        }
-
-        try {
-          await db.scan.update({
-            where: { id: scanId },
-            data: { status: "Completed", results: JSON.stringify(result) },
-          });
-        } catch {}
-
-        try { unlinkSync(csvFile); } catch {}
-        try { unlinkSync(statusFile); } catch {}
-
-        return { status: "Completed", results: result, error: null };
-
-      } else {
-        const xmlFile = join(TMP_DIR, `${scanId}.xml`);
-        const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
-        let result: NmapScanResult = { target: "", ports: [], vulnerabilities: [] };
-
-        if (existsSync(xmlFile)) {
-          try {
-            const xml = readFileSync(xmlFile, "utf-8");
-            if (xml.includes("</nmaprun>")) {
-              result = parseNmapXml("", xml);
-            }
-          } catch {}
-        }
-
-        if (existsSync(vulnXmlFile)) {
-          try {
-            const vulnXml = readFileSync(vulnXmlFile, "utf-8");
-            if (vulnXml.includes("</nmaprun>")) {
-              const vulnResult = parseNmapXml("", vulnXml);
-              if (vulnResult.vulnerabilities.length > 0) {
-                result.vulnerabilities = vulnResult.vulnerabilities;
-              }
-              const existingPorts = new Set(result.ports.map(p => p.port_id));
-              for (const p of vulnResult.ports) {
-                if (!existingPorts.has(p.port_id)) {
-                  result.ports.push(p);
-                  existingPorts.add(p.port_id);
-                }
-              }
-            }
-          } catch {}
-        }
-
-        try {
-          await db.scan.update({
-            where: { id: scanId },
-            data: { status: "Completed", results: JSON.stringify(result) },
-          });
-        } catch {}
-
-        try { unlinkSync(xmlFile); } catch {}
-        try { unlinkSync(vulnXmlFile); } catch {}
-        try { unlinkSync(statusFile); } catch {}
-
-        return { status: "Completed", results: result, error: null };
+    if (scan.status === "Completed" && scan.results) {
+      try {
+        const results = JSON.parse(scan.results) as ScanResultType;
+        return { status: "Completed", results, error: null };
+      } catch {
+        return { status: "Failed", results: null, error: "Failed to parse scan results" };
       }
     }
+
+    if (scan.status === "Failed") {
+      let error = "Scan failed";
+      if (scan.results) {
+        try {
+          const parsed = JSON.parse(scan.results);
+          if (parsed.error) error = parsed.error;
+        } catch {}
+      }
+      return { status: "Failed", results: null, error };
+    }
+
+    return { status: scan.status, results: null, error: null };
+  } catch (dbErr) {
+    console.error(`[ScanManager] DB lookup failed for scan ${scanId}:`, dbErr);
+    return { status: "Unknown", results: null, error: null };
   }
-
-  return { status: "Running", results: null, error: null };
 }
 
-// ─── API Route Handler ─────────────────────────────────────────────────────
+// ─── Main POST Handler ──────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { target, isAuthorized, scanType, port } = body;
+    const { target, isAuthorized, scanType, mode, port } = body as {
+      target: string;
+      isAuthorized: boolean;
+      scanType: string;
+      mode?: string;
+      port?: string;
+    };
 
+    // Validate
     if (!target || typeof target !== "string") {
-      return NextResponse.json({ error: "Target IP/hostname is required" }, { status: 400 });
+      return NextResponse.json({ error: "Target is required" }, { status: 400 });
     }
 
     const targetTrimmed = target.trim();
-    if (targetTrimmed.length < 3 || targetTrimmed.length > 253) {
-      return NextResponse.json({ error: "Invalid target format" }, { status: 400 });
-    }
-
     if (!isAuthorized) {
-      return NextResponse.json({ error: "You must confirm authorization before scanning" }, { status: 403 });
+      return NextResponse.json({ error: "Authorization required" }, { status: 403 });
     }
 
     const auth = verifyAuthorization(targetTrimmed);
     if (!auth.authorized) {
-      return NextResponse.json({ error: auth.reason || "Target not authorized for scanning" }, { status: 403 });
+      return NextResponse.json({ error: auth.reason }, { status: 403 });
     }
 
-    const effectiveScanType = resolveScanType(scanType || "nmap");
-    let scanId = uuidv4();
-    const scanPort = port || "80";
+    const effectiveScanType = resolveScanType(scanType);
 
-    // Check if hybrid mode (GitHub Actions) is configured
-    const isHybridMode = (body as Record<string, unknown>).mode === "hybrid" &&
-      !!(process.env.GITHUB_TOKEN && process.env.GITHUB_REPO);
-
-    if (isHybridMode) {
-      // Hybrid mode: dispatch to GitHub Actions
+    // ─── Hybrid Mode: Dispatch to GitHub Actions ───────────────────────────
+    if (mode === "hybrid") {
       const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
       const GITHUB_REPO = process.env.GITHUB_REPO;
-      const CALLBACK_URL = process.env.CALLBACK_URL || process.env.NEXT_PUBLIC_CALLBACK_URL;
-      const CALLBACK_SECRET = process.env.CALLBACK_SECRET || process.env.VULNGUARD_CALLBACK_SECRET || uuidv4();
 
-      // Create DB record
-      await db.scan.create({
-        data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running", mode: "hybrid" },
-      });
+      if (!GITHUB_TOKEN || !GITHUB_REPO) {
+        return NextResponse.json({
+          error: "GitHub Actions hybrid mode is not configured. Set GITHUB_TOKEN and GITHUB_REPO environment variables.",
+          hint: "See README for hybrid deployment setup instructions.",
+        }, { status: 501 });
+      }
 
-      const baseUrl = CALLBACK_URL || process.env.NEXT_PUBLIC_APP_URL || "https://your-app.vercel.app";
-      const fullCallbackUrl = `${baseUrl}/api/scan/callback`;
-
-      const dispatchUrl = `https://api.github.com/repos/${GITHUB_REPO}/dispatches`;
-      const dispatchPayload = {
-        event_type: "vulnscan",
-        client_payload: {
-          scan_id: scanId,
-          scan_type: effectiveScanType,
-          target: targetTrimmed,
-          port: scanPort,
-          callback_url: fullCallbackUrl,
-          callback_secret: CALLBACK_SECRET,
-        },
+      // Forward to dispatch endpoint
+      const dispatchBody = {
+        target: targetTrimmed,
+        scanType: effectiveScanType,
+        port: port || "80",
+        isAuthorized: true,
       };
 
-      console.log(`[API] Dispatching hybrid scan: ${scanId} (${effectiveScanType}) for ${targetTrimmed}`);
-
-      try {
-        const dispatchResponse = await fetch(dispatchUrl, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${GITHUB_TOKEN}`,
-            "Accept": "application/vnd.github.v3+json",
-            "Content-Type": "application/json",
-            "User-Agent": "VulnGuard-Scanner",
-          },
-          body: JSON.stringify(dispatchPayload),
-        });
-
-        if (!dispatchResponse.ok) {
-          const errorText = await dispatchResponse.text();
-          console.error(`[API] GitHub dispatch error: ${dispatchResponse.status}`, errorText);
-
-          await db.scan.update({
-            where: { id: scanId },
-            data: { status: "Failed", results: JSON.stringify({ error: `GitHub Actions dispatch failed (HTTP ${dispatchResponse.status}). Check GITHUB_TOKEN and GITHUB_REPO.` }) },
-          });
-
-          return NextResponse.json({
-            error: `Failed to dispatch scan to GitHub Actions (HTTP ${dispatchResponse.status}). Verify GITHUB_TOKEN has repo scope.`,
-            scan_id: scanId,
-          }, { status: 502 });
-        }
-
-        // Return immediately — results will come via callback
-        return NextResponse.json({
-          scan_id: scanId,
-          target: targetTrimmed,
-          scan_type: effectiveScanType,
-          status: "Running",
-          mode: "hybrid",
-          message: "Scan dispatched to GitHub Actions. Results will be available once the workflow completes.",
-        }, { status: 201 });
-
-      } catch (dispatchError) {
-        const errMsg = dispatchError instanceof Error ? dispatchError.message : "Dispatch failed";
-        await db.scan.update({
-          where: { id: scanId },
-          data: { status: "Failed", results: JSON.stringify({ error: errMsg }) },
-        });
-        return NextResponse.json({ error: errMsg, scan_id: scanId }, { status: 500 });
-      }
-    }
-
-    // Local mode — check tool availability
-    const toolName = effectiveScanType === "full" ? "nmap" : effectiveScanType;
-    const homeDir = process.env.HOME || "/root";
-    const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
-    const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
-    let toolAvailable = false;
-    try {
-      const whichCmd = `which ${toolName} 2>/dev/null || ls ${homeDir}/.local/bin/${toolName} 2>/dev/null || ls ${goBinDir}/${toolName} 2>/dev/null`;
-      await execWithTimeout(whichCmd, 5000, {
-        env: { ...process.env, PATH: envPath, HOME: homeDir },
+      const dispatchUrl = new URL("/api/scan/dispatch", request.url);
+      const dispatchResponse = await fetch(dispatchUrl.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(dispatchBody),
       });
-      toolAvailable = true;
-    } catch {
-      toolAvailable = false;
+
+      const dispatchData = await dispatchResponse.json() as Record<string, unknown>;
+
+      if (!dispatchResponse.ok) {
+        return NextResponse.json({
+          error: (dispatchData.error as string) || "Failed to dispatch scan to GitHub Actions",
+          scan_id: dispatchData.scan_id,
+        }, { status: dispatchResponse.status });
+      }
+
+      return NextResponse.json({
+        scan_id: dispatchData.scan_id,
+        target: targetTrimmed,
+        scan_type: effectiveScanType,
+        status: "running",
+        mode: "hybrid",
+      }, { status: 201 });
     }
 
-    if (!toolAvailable) {
-      return NextResponse.json({
-        error: `${toolName} is not installed or not in PATH. Install it or switch to Hybrid Mode (GitHub Actions) in the scan configuration.`,
-        scan_type: effectiveScanType,
-        target: targetTrimmed,
-        hint: "Set GITHUB_TOKEN and GITHUB_REPO env vars to enable GitHub Actions hybrid mode.",
-      }, { status: 501 });
-    }
+    // ─── Local Mode: Run Scans Directly ────────────────────────────────────
+    const scanId = uuidv4();
+    const scanPort = port || "80";
 
     // Create DB record
-    ensureTmpDir();
     await db.scan.create({
-      data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running" },
+      data: {
+        id: scanId,
+        target: targetTrimmed,
+        scanType: effectiveScanType,
+        status: "Running",
+        mode: "local",
+      },
     });
 
-    console.log(`[API] Starting ${effectiveScanType} scan for ${scanId}, target ${targetTrimmed}`);
+    console.log(`[API] Starting ${effectiveScanType} scan for ${targetTrimmed} (scanId: ${scanId})`);
+
+    let scanResult: ScanResultType;
+    let scanError: string | null = null;
 
     try {
-      // Execute scan synchronously with timeout
-      let results: ScanResultType;
-
       switch (effectiveScanType) {
         case "nmap":
-          results = await runNmapScan(targetTrimmed, scanId);
+          scanResult = await runNmapScan(targetTrimmed, scanId);
           break;
         case "nikto":
-          results = await runNiktoScan(targetTrimmed, scanPort, scanId);
+          scanResult = await runNiktoScan(targetTrimmed, scanPort, scanId);
           break;
         case "nuclei":
-          results = await runNucleiScan(targetTrimmed, scanPort, scanId);
+          scanResult = await runNucleiScan(targetTrimmed, scanPort, scanId);
           break;
         case "full":
-          results = await runFullScan(targetTrimmed, scanPort, scanId);
+          scanResult = await runFullScan(targetTrimmed, scanPort, scanId);
           break;
         default:
-          results = await runNmapScan(targetTrimmed, scanId);
+          scanResult = await runNmapScan(targetTrimmed, scanId);
       }
+    } catch (err) {
+      scanError = err instanceof Error ? err.message : "Scan execution failed";
+      console.error(`[API] Scan error: ${scanError}`);
 
-      // Save results to DB
-      await db.scan.update({
-        where: { id: scanId },
-        data: { status: "Completed", results: JSON.stringify(results) },
-      });
-
-      console.log(`[API] ${effectiveScanType} scan ${scanId} completed successfully`);
-
-      return NextResponse.json({
-        scan_id: scanId,
-        target: targetTrimmed,
-        scan_type: effectiveScanType,
-        status: "Completed",
-        results,
-      }, { status: 201 });
-
-    } catch (scanError) {
-      const errMsg = scanError instanceof Error ? scanError.message : "Scan execution failed";
-      console.error(`[API] ${effectiveScanType} scan ${scanId} failed:`, errMsg);
-
-      // Update DB with failure
-      try {
-        await db.scan.update({
-          where: { id: scanId },
-          data: { status: "Failed", results: JSON.stringify({ error: errMsg }) },
-        });
-      } catch {}
-
-      return NextResponse.json({
-        scan_id: scanId,
-        target: targetTrimmed,
-        scan_type: effectiveScanType,
-        status: "Failed",
-        error: errMsg,
-      }, { status: 500 });
+      // Create an empty result on error
+      switch (effectiveScanType) {
+        case "nikto":
+          scanResult = { target: targetTrimmed, scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
+          break;
+        case "nuclei":
+          scanResult = { target: targetTrimmed, scanType: "nuclei", findings: [], vulnerabilities: [], summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 } };
+          break;
+        case "full":
+          scanResult = {
+            target: targetTrimmed, scanType: "full", nmap: null, nikto: null, nuclei: null,
+            securityScore: { score: 0, grade: "F", label: "Scan Failed", breakdown: { openPorts: { count: 0, deduction: 0, details: "" }, vulnerabilities: { count: 0, deduction: 0, details: "" }, cves: { count: 0, deduction: 0, details: "" }, webFindings: { count: 0, deduction: 0, details: "" }, nucleiCritical: { count: 0, deduction: 0, details: "" }, nucleiHigh: { count: 0, deduction: 0, details: "" } } },
+            openPorts: [], vulnerabilityHints: [], summary: { totalOpenPorts: 0, totalVulnerabilities: 0, totalCves: 0, totalWebFindings: 0, enginesCompleted: 0 },
+          };
+          break;
+        default:
+          scanResult = { target: targetTrimmed, ports: [], vulnerabilities: [] };
+      }
     }
 
+    // Update DB record
+    const finalStatus = scanError ? "Failed" : "Completed";
+    try {
+      await db.scan.update({
+        where: { id: scanId },
+        data: {
+          status: finalStatus,
+          results: JSON.stringify(scanResult),
+          ...(scanError ? { results: JSON.stringify({ ...scanResult, error: scanError }) } : {}),
+        },
+      });
+    } catch (dbErr) {
+      console.error(`[API] Failed to update scan record:`, dbErr);
+    }
+
+    // Return results synchronously
+    return NextResponse.json({
+      scan_id: scanId,
+      target: targetTrimmed,
+      scan_type: effectiveScanType,
+      status: scanError ? "failed" : "completed",
+      results: scanResult,
+      ...(scanError ? { error: scanError } : {}),
+    });
+
   } catch (error) {
-    console.error("[API] Error creating scan:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    console.error("[API] Scan POST error:", error);
+    return NextResponse.json(
+      { error: `Internal server error: ${error instanceof Error ? error.message : "Unknown error"}` },
+      { status: 500 }
+    );
   }
 }
-
-export { parseNmapXml, parseNiktoCsv, parseNucleiJsonl };

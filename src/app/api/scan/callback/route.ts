@@ -8,6 +8,9 @@ import { db } from "@/lib/db";
  * (Ubuntu runner), the workflow posts results back here.
  *
  * Security: Requires CALLBACK_SECRET to match env var.
+ *
+ * Handles both raw output (XML, CSV, JSONL) from GitHub Actions
+ * and pre-parsed JSON results.
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -74,7 +77,7 @@ type ScanResultType = NmapScanResult | NiktoScanResult | NucleiScanResult | Full
 
 const CVE_REGEX = /CVE-\d{4}-\d{4,7}/g;
 
-// ─── Parsers ────────────────────────────────────────────────────────────────
+// ─── Parsers (shared with scan route) ───────────────────────────────────────
 
 function normalizeSeverity(severity: string): string {
   const s = severity.toLowerCase().trim();
@@ -110,8 +113,67 @@ function parseNmapXml(target: string, xml: string): NmapScanResult {
       versionStr = parts.length > 0 ? parts.join(" ") : "Unknown";
     }
     ports.push({ port_id: portId, protocol, state, service: serviceName, version: versionStr });
+
+    // Parse script output for CVEs
+    const scriptRegex = /<script\s+id="([^"]*)"\s+output="([^"]*)"([\s\S]*?)<\/script>/g;
+    let scriptMatch;
+    while ((scriptMatch = scriptRegex.exec(portBlock)) !== null) {
+      const scriptId = scriptMatch[1];
+      const scriptOutput = scriptMatch[2].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+      const scriptBody = scriptMatch[3];
+      const textParts: string[] = [scriptOutput];
+      const elemRegex = /<elem[^>]*>([\s\S]*?)<\/elem>/g;
+      let elemMatch;
+      while ((elemMatch = elemRegex.exec(scriptBody)) !== null) {
+        if (elemMatch[1]) textParts.push(elemMatch[1].trim());
+      }
+      const combinedText = textParts.join(" ");
+      CVE_REGEX.lastIndex = 0;
+      const cveMatches = combinedText.match(CVE_REGEX);
+      if (cveMatches) {
+        const seen = new Set<string>();
+        for (const cveId of cveMatches) {
+          if (!seen.has(cveId)) {
+            seen.add(cveId);
+            vulnerabilities.push({
+              port_id: portId,
+              cve_id: cveId,
+              description: `${cveId} detected by nmap ${scriptId} script on port ${portId}/${protocol}`,
+            });
+          }
+        }
+      }
+    }
   }
   return { target, ports, vulnerabilities };
+}
+
+function mergeNmapResults(base: NmapScanResult, vuln: NmapScanResult): NmapScanResult {
+  // Merge vulnerabilities (dedup by CVE ID)
+  const existingCves = new Set(base.vulnerabilities.map(v => v.cve_id));
+  for (const v of vuln.vulnerabilities) {
+    if (!existingCves.has(v.cve_id)) {
+      base.vulnerabilities.push(v);
+      existingCves.add(v.cve_id);
+    }
+  }
+
+  // Merge port info (update existing ports with more detail, add new ones)
+  const existingPorts = new Map(base.ports.map(p => [p.port_id, p]));
+  for (const p of vuln.ports) {
+    const existing = existingPorts.get(p.port_id);
+    if (existing) {
+      if (existing.version === "Unknown" && p.version !== "Unknown") {
+        existing.version = p.version;
+        existing.service = p.service;
+      }
+    } else {
+      base.ports.push(p);
+      existingPorts.set(p.port_id, p);
+    }
+  }
+
+  return base;
 }
 
 function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
@@ -125,18 +187,29 @@ function parseNiktoCsv(target: string, csv: string): NiktoScanResult {
     let inQuotes = false;
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
-      if (ch === '"') { inQuotes = !inQuotes; } else if (ch === ',' && !inQuotes) { fields.push(current); current = ""; } else { current += ch; }
+      if (ch === '"') { if (inQuotes && i + 1 < line.length && line[i + 1] === '"') { current += '"'; i++; } else { inQuotes = !inQuotes; } } else if (ch === ',' && !inQuotes) { fields.push(current); current = ""; } else { current += ch; }
     }
     fields.push(current);
     if (fields.length <= 1 && fields[0]?.startsWith("Nikto")) continue;
-    if (fields.length >= 7) {
-      const [host, ip, portStr, references, method, path, description] = fields;
-      const port = parseInt(portStr, 10) || 80;
-      findings.push({
-        id: `nikto-${findings.length + 1}`, host: host || target, ip: ip || "", port,
-        method: method || "GET", path: path || "/", description: description || "",
-        references: references ? references.split(",").map(r => r.trim()).filter(Boolean) : [],
-      });
+    if (fields.length < 7) continue;
+    const [host, ip, portStr, references, method, path, description] = fields;
+    if (!description || description.trim().length === 0) continue;
+    const port = parseInt(portStr, 10) || 80;
+    if (description?.includes("Server:")) {
+      const serverMatch = description.match(/Server:\s*([^\s,]+)/);
+      if (serverMatch) server = serverMatch[1];
+    }
+    findings.push({
+      id: `nikto-${findings.length + 1}`, host: host || target, ip: ip || "", port,
+      method: method || "GET", path: path || "/", description: description || "",
+      references: references ? references.split(",").map(r => r.trim()).filter(Boolean) : [],
+    });
+    CVE_REGEX.lastIndex = 0;
+    const allText = `${references} ${description}`;
+    const cveMatches = allText.match(CVE_REGEX);
+    if (cveMatches) {
+      const seen = new Set<string>();
+      for (const cveId of cveMatches) { if (!seen.has(cveId)) { seen.add(cveId); vulnerabilities.push({ port_id: port, cve_id: cveId, description: `${cveId} detected by Nikto on port ${port}` }); } }
     }
   }
   const summary = {
@@ -156,6 +229,7 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
   for (const line of lines) {
     try {
       const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj.type === "templates" || obj.type === "error") continue;
       const info = (obj.info as Record<string, unknown>) || {};
       const templateId = (obj["template-id"] as string) || "";
       const name = (info.name as string) || templateId || "Unknown Finding";
@@ -181,7 +255,12 @@ function parseNucleiJsonl(target: string, jsonl: string): NucleiScanResult {
       }
     } catch { /* skip */ }
   }
-  const summary = { total: findings.length, critical: findings.filter(f => f.severity === "critical").length, high: findings.filter(f => f.severity === "high").length, medium: findings.filter(f => f.severity === "medium").length, low: findings.filter(f => f.severity === "low").length, info: findings.filter(f => f.severity === "info").length, withCurlCommand: findings.filter(f => f.curlCommand).length, withExtractedResults: findings.filter(f => f.extractedResults.length > 0).length };
+  const summary = {
+    total: findings.length, critical: findings.filter(f => f.severity === "critical").length,
+    high: findings.filter(f => f.severity === "high").length, medium: findings.filter(f => f.severity === "medium").length,
+    low: findings.filter(f => f.severity === "low").length, info: findings.filter(f => f.severity === "info").length,
+    withCurlCommand: findings.filter(f => f.curlCommand).length, withExtractedResults: findings.filter(f => f.extractedResults.length > 0).length,
+  };
   return { target, scanType: "nuclei", findings, vulnerabilities, summary };
 }
 
@@ -277,11 +356,29 @@ export async function POST(request: NextRequest) {
     let parsedResult: ScanResultType;
 
     if (scanType === "nmap") {
-      if (rawResults.nmap && typeof rawResults.nmap === "object") {
-        parsedResult = rawResults.nmap as NmapScanResult;
-      } else {
-        parsedResult = { target: targetHost, ports: [], vulnerabilities: [] };
+      // Handle nmap results — could be raw XML or pre-parsed JSON
+      let nmapResult: NmapScanResult = { target: targetHost, ports: [], vulnerabilities: [] };
+
+      if (rawResults.nmap && typeof rawResults.nmap === "object" && !("raw" in rawResults.nmap)) {
+        // Pre-parsed JSON
+        nmapResult = rawResults.nmap as NmapScanResult;
+      } else if (rawResults.nmap_xml && typeof rawResults.nmap_xml === "string") {
+        // Raw XML from GitHub Actions
+        nmapResult = parseNmapXml(targetHost, rawResults.nmap_xml);
+      } else if (rawResults.nmap && typeof rawResults.nmap === "object" && "raw" in rawResults.nmap) {
+        // Old format: { raw: "xml..." }
+        const raw = (rawResults.nmap as { raw: string }).raw;
+        if (raw) nmapResult = parseNmapXml(targetHost, raw);
       }
+
+      // Merge vuln XML if available
+      if (rawResults.nmap_vuln_xml && typeof rawResults.nmap_vuln_xml === "string") {
+        const vulnResult = parseNmapXml(targetHost, rawResults.nmap_vuln_xml);
+        nmapResult = mergeNmapResults(nmapResult, vulnResult);
+      }
+
+      parsedResult = nmapResult;
+
     } else if (scanType === "nikto") {
       if (rawResults.nikto_raw && typeof rawResults.nikto_raw === "string") {
         parsedResult = parseNiktoCsv(targetHost, rawResults.nikto_raw);
@@ -304,11 +401,36 @@ export async function POST(request: NextRequest) {
       let niktoResult: NiktoScanResult | null = null;
       let nucleiResult: NucleiScanResult | null = null;
 
-      if (rawResults.nmap && typeof rawResults.nmap === "object") nmapResult = rawResults.nmap as NmapScanResult;
-      if (rawResults.nikto_raw && typeof rawResults.nikto_raw === "string") niktoResult = parseNiktoCsv(targetHost, rawResults.nikto_raw);
-      else if (rawResults.nikto && typeof rawResults.nikto === "object") niktoResult = rawResults.nikto as NiktoScanResult;
-      if (rawResults.nuclei_raw && typeof rawResults.nuclei_raw === "string") nucleiResult = parseNucleiJsonl(targetHost, rawResults.nuclei_raw);
-      else if (rawResults.nuclei && typeof rawResults.nuclei === "object") nucleiResult = rawResults.nuclei as NucleiScanResult;
+      // Parse nmap
+      if (rawResults.nmap_xml && typeof rawResults.nmap_xml === "string") {
+        nmapResult = parseNmapXml(targetHost, rawResults.nmap_xml);
+        // Merge vuln XML
+        if (rawResults.nmap_vuln_xml && typeof rawResults.nmap_vuln_xml === "string") {
+          const vulnResult = parseNmapXml(targetHost, rawResults.nmap_vuln_xml);
+          nmapResult = mergeNmapResults(nmapResult, vulnResult);
+        }
+      } else if (rawResults.nmap && typeof rawResults.nmap === "object") {
+        if ("raw" in rawResults.nmap) {
+          const raw = (rawResults.nmap as { raw: string }).raw;
+          if (raw) nmapResult = parseNmapXml(targetHost, raw);
+        } else {
+          nmapResult = rawResults.nmap as NmapScanResult;
+        }
+      }
+
+      // Parse nikto
+      if (rawResults.nikto_raw && typeof rawResults.nikto_raw === "string") {
+        niktoResult = parseNiktoCsv(targetHost, rawResults.nikto_raw);
+      } else if (rawResults.nikto && typeof rawResults.nikto === "object") {
+        niktoResult = rawResults.nikto as NiktoScanResult;
+      }
+
+      // Parse nuclei
+      if (rawResults.nuclei_raw && typeof rawResults.nuclei_raw === "string") {
+        nucleiResult = parseNucleiJsonl(targetHost, rawResults.nuclei_raw);
+      } else if (rawResults.nuclei && typeof rawResults.nuclei === "object") {
+        nucleiResult = rawResults.nuclei as NucleiScanResult;
+      }
 
       const securityScore = calculateSecurityScore(nmapResult, niktoResult, nucleiResult);
       const vulnerabilityHints = buildVulnerabilityHints(nmapResult, niktoResult, nucleiResult);

@@ -10,7 +10,7 @@ import { processScanResults } from "../route";
  * to prevent infinite polling.
  */
 
-const MAX_SCAN_DURATION_MS = 3 * 60 * 1000; // 3 minutes
+const MAX_SCAN_DURATION_MS = 10 * 60 * 1000; // 10 minutes (hybrid scans can take longer)
 
 export async function GET(
   request: NextRequest,
