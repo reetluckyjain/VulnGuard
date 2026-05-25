@@ -185,9 +185,12 @@ function execWithTimeout(command: string, timeoutMs: number, options?: Record<st
 
 async function checkToolAvailable(tool: string): Promise<boolean> {
   const isWindows = process.platform === "win32";
+  const envPath = `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`;
   const cmd = isWindows ? `where ${tool} 2>nul` : `which ${tool} 2>/dev/null`;
   try {
-    await execWithTimeout(cmd, 5000);
+    await execWithTimeout(cmd, 5000, {
+      env: { ...process.env, PATH: envPath, HOME: process.env.HOME || "/root" },
+    });
     return true;
   } catch {
     return false;
@@ -207,7 +210,8 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
   ensureTmpDir();
   const xmlFile = join(TMP_DIR, `${scanId}.xml`);
 
-  const envPath = `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`;
+  const homeDir = process.env.HOME || "/root";
+  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
 
   // Fast nmap scan: service version detection on top 100 ports only
   // NO --script vuln (too slow, causes 5-10 min hangs)
@@ -215,7 +219,7 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
 
   try {
     await execWithTimeout(cmd, NMAP_TIMEOUT, {
-      env: { ...process.env, PATH: envPath },
+      env: { ...process.env, PATH: envPath, HOME: homeDir },
     });
   } catch {
     // Scan may have timed out but still produced partial output - check below
@@ -237,7 +241,7 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
   const fallbackCmd = `nmap -sT -F --top-ports 100 --max-retries 1 --host-timeout 30s --min-rate 100 -oX "${xmlFile}" "${target}"`;
   try {
     await execWithTimeout(fallbackCmd, NMAP_TIMEOUT / 2, {
-      env: { ...process.env, PATH: envPath },
+      env: { ...process.env, PATH: envPath, HOME: homeDir },
     });
   } catch {}
 
@@ -263,7 +267,8 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
   ensureTmpDir();
   const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
 
-  const envPath = `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`;
+  const homeDir = process.env.HOME || "/root";
+  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
 
   // Build nikto URL
   const niktoTarget = `http${port === "443" ? "s" : ""}://${target}:${port}`;
@@ -272,7 +277,7 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
 
   try {
     await execWithTimeout(cmd, NIKTO_TIMEOUT, {
-      env: { ...process.env, PATH: envPath },
+      env: { ...process.env, PATH: envPath, HOME: homeDir, NIKTODIR: `${homeDir}/nikto/program`, PERL5LIB: `${homeDir}/nikto/program` },
     });
   } catch {
     // May have timed out but still produced output
@@ -299,8 +304,9 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
   ensureTmpDir();
   const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
 
-  const envPath = `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`;
-  const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${process.env.HOME || ""}/nuclei-templates`;
+  const homeDir = process.env.HOME || "/root";
+  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
+  const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${homeDir}/nuclei-templates`;
 
   // Build target URL
   let scanUrl: string;
@@ -315,11 +321,12 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
   }
 
   // Use limited templates for speed (don't scan ALL templates)
-  const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -ot -timeout 5 -c 10 -rl 50 -retries 1 -no-strict-syntax -t "${templatesDir}/http/cves/" -t "${templatesDir}/http/vulnerabilities/" -t "${templatesDir}/http/exposures/" -t "${templatesDir}/http/misconfiguration/"`;
+  // Removed -ot (omit-template) and -no-strict-syntax for v3.8.0 compatibility
+  const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -timeout 5 -c 10 -rl 50 -retries 1 -t "${templatesDir}/http/cves/" -t "${templatesDir}/http/vulnerabilities/" -t "${templatesDir}/http/exposures/" -t "${templatesDir}/http/misconfiguration/"`;
 
   try {
     await execWithTimeout(cmd, NUCLEI_TIMEOUT, {
-      env: { ...process.env, PATH: envPath, NUCLEI_TEMPLATES_DIR: templatesDir },
+      env: { ...process.env, PATH: envPath, HOME: homeDir, NUCLEI_TEMPLATES_DIR: templatesDir },
     });
   } catch {
     // May have timed out but still produced output
