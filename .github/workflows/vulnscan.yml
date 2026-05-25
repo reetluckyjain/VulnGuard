@@ -1,268 +1,220 @@
-# VulnGuard — Hybrid Scanner Workflow
-# Triggered by repository_dispatch from the VulnGuard frontend
-# Runs on Ubuntu with real scanner tools (nmap, nikto, nuclei)
-# Posts results back to the VulnGuard callback API
-
-name: VulnGuard Scan
+name: VulnGuard Security Scan
 
 on:
   repository_dispatch:
     types: [vulnscan]
 
-permissions:
-  contents: read
-
-env:
-  SCAN_ID: ${{ github.event.client_payload.scan_id }}
-  SCAN_TYPE: ${{ github.event.client_payload.scan_type }}
-  TARGET: ${{ github.event.client_payload.target }}
-  PORT: ${{ github.event.client_payload.port || '80' }}
-  CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-  CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
+timeout-minutes: 5
 
 jobs:
-  scan:
+  vulnscan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    env:
+      SCAN_ID: ${{ github.event.client_payload.scan_id }}
+      SCAN_TYPE: ${{ github.event.client_payload.scan_type }}
+      TARGET: ${{ github.event.client_payload.target }}
+      PORT: ${{ github.event.client_payload.port || '80' }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
 
     steps:
-      - name: Log scan parameters
+      # ── Configure target URL based on port ──────────────────────────────────
+      - name: Configure target URL
         run: |
-          echo "=== VulnGuard Hybrid Scan ==="
-          echo "Scan ID: $SCAN_ID"
-          echo "Scan Type: $SCAN_TYPE"
-          echo "Target: $TARGET"
-          echo "Port: $PORT"
+          if [ "$PORT" = "443" ]; then
+            echo "TARGET_URL=https://$TARGET:$PORT" >> "$GITHUB_ENV"
+          else
+            echo "TARGET_URL=http://$TARGET:$PORT" >> "$GITHUB_ENV"
+          fi
+          echo "Target: $TARGET | Port: $PORT | URL: $( [ "$PORT" = "443" ] && echo "https://$TARGET:$PORT" || echo "http://$TARGET:$PORT" )"
 
+      # ── Install scanner tools ───────────────────────────────────────────────
       - name: Install scanner tools
         run: |
-          # Nmap
+          echo "Installing nmap and nikto via apt..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq nmap
+          sudo apt-get install -y -qq nmap nikto
 
-          # Nikto
-          sudo apt-get install -y -qq nikto
+          echo "Installing nuclei via Go..."
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
-          # Nuclei (via Go install)
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          # Add Go bin to PATH for subsequent steps
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-          # Verify installations
-          nmap --version | head -1
-          nikto -Version 2>&1 | head -3
-          nuclei -version 2>&1 | head -1
+          # Download nuclei templates (needed for scan step)
+          echo "Downloading nuclei templates..."
+          "$HOME/go/bin/nuclei" -update-templates
 
-      - name: Install Nuclei templates
+          echo "All scanner tools installed successfully."
+
+      # ── Execute scan ────────────────────────────────────────────────────────
+      - name: Execute scan
+        id: scan
         run: |
-          nuclei -update-templates 2>&1 | tail -3
-          echo "NUCLEI_TEMPLATES_DIR=$HOME/nuclei-templates" >> $GITHUB_ENV
+          set +e  # Don't exit on scanner errors — we still want to send callback
 
-      - name: Run Nmap scan
-        if: env.SCAN_TYPE == 'nmap' || env.SCAN_TYPE == 'full'
-        run: |
-          SCAN_ID="${SCAN_ID}"
-          TARGET="${TARGET}"
-          XML_FILE="/tmp/vulnguard-${SCAN_ID}-nmap.xml"
+          echo "=========================================="
+          echo "  VulnGuard Scan: $SCAN_TYPE"
+          echo "  Target: $TARGET"
+          echo "  Port: $PORT"
+          echo "=========================================="
 
-          echo "Running nmap scan against ${TARGET}..."
-          nmap -sT -sV -F --top-ports 100 --max-retries 1 --host-timeout 30s --min-rate 100 -oX "${XML_FILE}" "${TARGET}" || true
+          case "$SCAN_TYPE" in
+            nmap)
+              echo "::group::Nmap Scan"
+              nmap -sT -sV -F --top-ports 100 --max-retries 1 \
+                --host-timeout 30s --min-rate 100 \
+                -oX /tmp/nmap_results.xml "$TARGET"
+              echo "::endgroup::"
+              ;;
 
-          if [ -f "${XML_FILE}" ]; then
-            echo "nmap output saved to ${XML_FILE}"
-            echo "NMAP_XML_FILE=${XML_FILE}" >> $GITHUB_ENV
-          else
-            echo "nmap produced no output"
-          fi
+            nikto)
+              echo "::group::Nikto Scan"
+              nikto -h "$TARGET:$PORT" -Format csv \
+                -o /tmp/nikto_results.csv \
+                -nointeractive -C all -maxtime 60s
+              echo "::endgroup::"
+              ;;
 
-      - name: Run Nikto scan
-        if: env.SCAN_TYPE == 'nikto' || env.SCAN_TYPE == 'full'
-        run: |
-          SCAN_ID="${SCAN_ID}"
-          TARGET="${TARGET}"
-          PORT="${PORT}"
-          CSV_FILE="/tmp/vulnguard-${SCAN_ID}-nikto.csv"
+            nuclei)
+              echo "::group::Nuclei Scan"
+              nuclei -u "$TARGET_URL" \
+                -jle /tmp/nuclei_results.jsonl \
+                -silent -timeout 5 -c 10 -rl 50 -retries 1 \
+                -t ~/nuclei-templates/http/cves/ \
+                -t ~/nuclei-templates/http/vulnerabilities/ \
+                -t ~/nuclei-templates/http/exposures/ \
+                -t ~/nuclei-templates/http/misconfiguration/
+              echo "::endgroup::"
+              ;;
 
-          if [ "$PORT" = "443" ]; then
-            NIKTO_TARGET="https://${TARGET}:${PORT}"
-          else
-            NIKTO_TARGET="http://${TARGET}:${PORT}"
-          fi
+            full)
+              echo "::group::Full Scan (nmap + nikto + nuclei in parallel)"
 
-          echo "Running nikto scan against ${NIKTO_TARGET}..."
-          nikto -h "${NIKTO_TARGET}" -Format csv -o "${CSV_FILE}" -nointeractive -C all -maxtime 60s || true
+              # Launch all three scanners as background processes
+              nmap -sT -sV -F --top-ports 100 --max-retries 1 \
+                --host-timeout 30s --min-rate 100 \
+                -oX /tmp/nmap_results.xml "$TARGET" &
+              NMAP_PID=$!
 
-          if [ -f "${CSV_FILE}" ]; then
-            echo "nikto output saved to ${CSV_FILE}"
-            echo "NIKTO_CSV_FILE=${CSV_FILE}" >> $GITHUB_ENV
-          else
-            echo "nikto produced no output"
-          fi
+              nikto -h "$TARGET:$PORT" -Format csv \
+                -o /tmp/nikto_results.csv \
+                -nointeractive -C all -maxtime 60s &
+              NIKTO_PID=$!
 
-      - name: Run Nuclei scan
-        if: env.SCAN_TYPE == 'nuclei' || env.SCAN_TYPE == 'full'
-        run: |
-          SCAN_ID="${SCAN_ID}"
-          TARGET="${TARGET}"
-          PORT="${PORT}"
-          JSONL_FILE="/tmp/vulnguard-${SCAN_ID}-nuclei.jsonl"
-          TEMPLATES_DIR="${NUCLEI_TEMPLATES_DIR:-$HOME/nuclei-templates}"
+              nuclei -u "$TARGET_URL" \
+                -jle /tmp/nuclei_results.jsonl \
+                -silent -timeout 5 -c 10 -rl 50 -retries 1 \
+                -t ~/nuclei-templates/http/cves/ \
+                -t ~/nuclei-templates/http/vulnerabilities/ \
+                -t ~/nuclei-templates/http/exposures/ \
+                -t ~/nuclei-templates/http/misconfiguration/ &
+              NUCLEI_PID=$!
 
-          # Build target URL
-          if echo "${TARGET}" | grep -qE '^https?://'; then
-            SCAN_URL="${TARGET}"
-          elif [ "$PORT" = "443" ]; then
-            SCAN_URL="https://${TARGET}"
-          elif [ "$PORT" != "80" ] && [ -n "$PORT" ]; then
-            SCAN_URL="http://${TARGET}:${PORT}"
-          else
-            SCAN_URL="http://${TARGET}"
-          fi
+              # Wait for all background processes to complete
+              wait "$NMAP_PID";  NMAP_EXIT=$?
+              wait "$NIKTO_PID"; NIKTO_EXIT=$?
+              wait "$NUCLEI_PID"; NUCLEI_EXIT=$?
 
-          echo "Running nuclei scan against ${SCAN_URL}..."
-          nuclei -u "${SCAN_URL}" -jle "${JSONL_FILE}" -silent -timeout 5 -c 10 -rl 50 -retries 1 \
-            -t "${TEMPLATES_DIR}/http/cves/" \
-            -t "${TEMPLATES_DIR}/http/vulnerabilities/" \
-            -t "${TEMPLATES_DIR}/http/exposures/" \
-            -t "${TEMPLATES_DIR}/http/misconfiguration/" || true
+              echo "Nmap exit: $NMAP_EXIT | Nikto exit: $NIKTO_EXIT | Nuclei exit: $NUCLEI_EXIT"
+              echo "::endgroup::"
+              ;;
 
-          if [ ! -f "${JSONL_FILE}" ]; then
-            touch "${JSONL_FILE}"
-          fi
+            *)
+              echo "ERROR: Unknown scan type '$SCAN_TYPE'"
+              echo "SCAN_ERROR=Unknown scan type: $SCAN_TYPE" >> "$GITHUB_ENV"
+              ;;
+          esac
 
-          echo "nuclei output saved to ${JSONL_FILE}"
-          echo "NUCLEI_JSONL_FILE=${JSONL_FILE}" >> $GITHUB_ENV
+          echo "Scan execution step completed."
 
-      - name: Package and post results
+      # ── Send results callback ───────────────────────────────────────────────
+      - name: Send results callback
         if: always()
-        env:
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
         run: |
-          #!/bin/bash
-          set -e
-
-          SCAN_ID="${SCAN_ID}"
-          SCAN_TYPE="${SCAN_TYPE}"
-          TARGET="${TARGET}"
-          PORT="${PORT}"
-
-          echo "Packaging results for scan ${SCAN_ID}..."
-
-          # Create results JSON
-          RESULTS_JSON="{}"
-
-          if [ "$SCAN_TYPE" = "nmap" ] || [ "$SCAN_TYPE" = "full" ]; then
-            if [ -n "${NMAP_XML_FILE}" ] && [ -f "${NMAP_XML_FILE}" ]; then
-              NMAP_CONTENT=$(cat "${NMAP_XML_FILE}" | python3 -c "
-          import sys, json, re
-
-          xml = sys.stdin.read()
-          ports = []
-          vulns = []
-
-          port_re = re.compile(r'<port\s+protocol=\"([^\"]*)\"\s+portid=\"(\d+)\">([\s\S]*?)</port>')
-          for m in port_re.finditer(xml):
-              proto, port_id, block = m.group(1), int(m.group(2)), m.group(3)
-              state_m = re.search(r'<state\s+state=\"([^\"]*)\"', block)
-              state = state_m.group(1) if state_m else 'unknown'
-              svc_m = re.search(r'<service\s+([^>]*?)(?:/|>)', block)
-              service, version = 'unknown', 'Unknown'
-              if svc_m:
-                  attrs = svc_m.group(1)
-                  service = re.search(r'name=\"([^\"]*)\"', attrs)
-                  service = service.group(1) if service else 'unknown'
-                  parts = []
-                  for field in ['product', 'version', 'extrainfo']:
-                      fm = re.search(field + r'=\"([^\"]*)\"', attrs)
-                      if fm: parts.append(fm.group(1))
-                  version = ' '.join(parts) if parts else 'Unknown'
-              ports.append({'port_id': port_id, 'protocol': proto, 'state': state, 'service': service, 'version': version})
-
-          print(json.dumps({'target': '${TARGET}', 'ports': ports, 'vulnerabilities': vulns}))
-          " 2>/dev/null || echo "{\"target\":\"${TARGET}\",\"ports\":[],\"vulnerabilities\":[]}")
-              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
-          import sys, json
-          results = json.loads(sys.stdin.read())
-          nmap_data = json.loads('''${NMAP_CONTENT}''')
-          results['nmap'] = nmap_data
-          print(json.dumps(results))
-          " 2>/dev/null || echo "$RESULTS_JSON")
-            fi
-          fi
-
-          if [ "$SCAN_TYPE" = "nikto" ] || [ "$SCAN_TYPE" = "full" ]; then
-            if [ -n "${NIKTO_CSV_FILE}" ] && [ -f "${NIKTO_CSV_FILE}" ]; then
-              NIKTO_BASE64=$(base64 -w0 "${NIKTO_CSV_FILE}")
-              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
-          import sys, json, base64
-          results = json.loads(sys.stdin.read())
-          csv_b64 = '${NIKTO_BASE64}'
-          csv_data = base64.b64decode(csv_b64).decode('utf-8')
-          results['nikto_raw'] = csv_data
-          print(json.dumps(results))
-          " 2>/dev/null || echo "$RESULTS_JSON")
-            fi
-          fi
-
-          if [ "$SCAN_TYPE" = "nuclei" ] || [ "$SCAN_TYPE" = "full" ]; then
-            if [ -n "${NUCLEI_JSONL_FILE}" ] && [ -f "${NUCLEI_JSONL_FILE}" ]; then
-              NUCLEI_BASE64=$(base64 -w0 "${NUCLEI_JSONL_FILE}")
-              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
-          import sys, json, base64
-          results = json.loads(sys.stdin.read())
-          jsonl_b64 = '${NUCLEI_BASE64}'
-          jsonl_data = base64.b64decode(jsonl_b64).decode('utf-8')
-          results['nuclei_raw'] = jsonl_data
-          print(json.dumps(results))
-          " 2>/dev/null || echo "$RESULTS_JSON")
-            fi
-          fi
-
-          # Build callback payload
-          CALLBACK_PAYLOAD=$(python3 -c "
+          # ── Build JSON payload with Python (handles escaping reliably) ──
+          python3 << 'PYEOF'
           import json
+          import os
+
+          scan_id = os.environ.get("SCAN_ID", "unknown")
+          scan_type = os.environ.get("SCAN_TYPE", "nmap")
+          target = os.environ.get("TARGET", "")
+          port = os.environ.get("PORT", "80")
+          callback_secret = os.environ.get("CALLBACK_SECRET", "")
+          scan_error = os.environ.get("SCAN_ERROR", "")
+
+          results = {}
+
+          # ── Collect nmap results ──
+          if scan_type in ("nmap", "full"):
+              try:
+                  with open("/tmp/nmap_results.xml", "r", errors="replace") as f:
+                      results["nmap"] = {"raw": f.read()}
+              except FileNotFoundError:
+                  if scan_type == "nmap":
+                      scan_error = scan_error or "nmap scan produced no output file"
+
+          # ── Collect nikto results ──
+          if scan_type in ("nikto", "full"):
+              try:
+                  with open("/tmp/nikto_results.csv", "r", errors="replace") as f:
+                      results["nikto_raw"] = f.read()
+              except FileNotFoundError:
+                  if scan_type == "nikto":
+                      scan_error = scan_error or "nikto scan produced no output file"
+
+          # ── Collect nuclei results ──
+          if scan_type in ("nuclei", "full"):
+              try:
+                  with open("/tmp/nuclei_results.jsonl", "r", errors="replace") as f:
+                      results["nuclei_raw"] = f.read()
+              except FileNotFoundError:
+                  if scan_type == "nuclei":
+                      scan_error = scan_error or "nuclei scan produced no output file"
+
+          # Determine final status
+          status = "Failed" if scan_error else "Completed"
+
           payload = {
-              'scan_id': '${SCAN_ID}',
-              'scan_type': '${SCAN_TYPE}',
-              'target': '${TARGET}',
-              'port': '${PORT}',
-              'status': 'Completed',
-              'results': json.loads('''${RESULTS_JSON}'''),
-              'callback_secret': '${CALLBACK_SECRET}'
+              "scan_id": scan_id,
+              "scan_type": scan_type,
+              "target": target,
+              "port": port,
+              "status": status,
+              "error": scan_error,
+              "callback_secret": callback_secret,
+              "results": results,
           }
-          print(json.dumps(payload))
-          " 2>/dev/null)
 
-          if [ -z "$CALLBACK_PAYLOAD" ]; then
-            # Fallback: simpler payload
-            CALLBACK_PAYLOAD="{\"scan_id\":\"${SCAN_ID}\",\"scan_type\":\"${SCAN_TYPE}\",\"target\":\"${TARGET}\",\"port\":\"${PORT}\",\"status\":\"Completed\",\"results\":{},\"callback_secret\":\"${CALLBACK_SECRET}\"}"
-          fi
+          # Write payload to file for curl to POST
+          with open("/tmp/callback_payload.json", "w") as f:
+              json.dump(payload, f)
 
-          # Post results back
-          if [ -n "${CALLBACK_URL}" ]; then
-            echo "Posting results to ${CALLBACK_URL}..."
+          print(f"Scan {scan_id}: {status}")
+          if scan_error:
+              print(f"Error: {scan_error}")
+          print(f"Results keys: {list(results.keys())}")
+          PYEOF
+
+          # ── POST callback via curl ──
+          if [ -n "$CALLBACK_URL" ]; then
+            echo "Posting results to callback URL..."
             HTTP_CODE=$(curl -s -o /tmp/callback_response.txt -w "%{http_code}" \
-              -X POST "${CALLBACK_URL}" \
+              -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
-              -d "${CALLBACK_PAYLOAD}" \
-              --max-time 30 || echo "000")
+              -d @/tmp/callback_payload.json \
+              --max-time 30 \
+              --retry 2 \
+              --retry-delay 5)
+            echo "Callback response: HTTP $HTTP_CODE"
 
-            echo "Callback response: HTTP ${HTTP_CODE}"
-            cat /tmp/callback_response.txt 2>/dev/null || true
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "Warning: Callback returned HTTP $HTTP_CODE"
+              echo "Response body:"
+              cat /tmp/callback_response.txt 2>/dev/null || true
+            fi
           else
-            echo "No callback URL provided. Results:"
-            echo "${CALLBACK_PAYLOAD}" | python3 -m json.tool 2>/dev/null || echo "${CALLBACK_PAYLOAD}"
-          fi
-
-      - name: Report failure
-        if: failure()
-        env:
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
-        run: |
-          if [ -n "${CALLBACK_URL}" ]; then
-            curl -s -X POST "${CALLBACK_URL}" \
-              -H "Content-Type: application/json" \
-              -d "{\"scan_id\":\"${SCAN_ID}\",\"scan_type\":\"${SCAN_TYPE}\",\"target\":\"${TARGET}\",\"status\":\"Failed\",\"error\":\"GitHub Actions scan workflow failed\",\"callback_secret\":\"${CALLBACK_SECRET}\"}" \
-              --max-time 30 || true
+            echo "Warning: No callback URL provided — results not posted"
+            echo "Payload saved to /tmp/callback_payload.json for debugging"
           fi
