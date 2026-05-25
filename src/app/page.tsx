@@ -215,6 +215,7 @@ export default function Home() {
   const [target, setTarget] = useState('')
   const [scanType, setScanType] = useState<'nmap' | 'nikto' | 'nuclei' | 'full'>('nmap')
   const [niktoPort, setNiktoPort] = useState('80')
+  const [scanMode, setScanMode] = useState<'local' | 'hybrid'>('local')
   const [isAuthorized, setIsAuthorized] = useState(false)
   const [validationError, setValidationError] = useState('')
   const [isScanning, setIsScanning] = useState(false)
@@ -306,7 +307,9 @@ export default function Home() {
     setRemediation(null)
     setRemediationError('')
     setScanStatusText(
-      scanType === 'full' ? 'Running full scan (all 3 engines)...'
+      scanMode === 'hybrid'
+        ? `Dispatching ${scanType} scan to GitHub Actions (Ubuntu)...`
+        : scanType === 'full' ? 'Running full scan (all 3 engines)...'
         : scanType === 'nikto' ? 'Running real Nikto web scan...'
         : scanType === 'nuclei' ? 'Running real Nuclei bug hunt...'
         : 'Running real nmap scan...'
@@ -315,10 +318,11 @@ export default function Home() {
     const historyEntry: ScanHistoryEntry = { id: scanId, target: target.trim(), scanType, status: 'running', timestamp: new Date().toISOString() }
     setScanHistory(prev => [historyEntry, ...prev])
     try {
-      // POST now executes the scan synchronously and returns results immediately
-      setScanStatusText(`Executing ${scanType} scan — this may take up to 2 minutes...`)
+      setScanStatusText(scanMode === 'hybrid'
+        ? `Scan dispatched to GitHub Actions — waiting for results...`
+        : `Executing ${scanType} scan — this may take up to 2 minutes...`)
       const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 180_000) // 3 min client-side timeout
+      const timeoutId = setTimeout(() => controller.abort(), scanMode === 'hybrid' ? 600_000 : 180_000) // 10 min for hybrid, 3 min for local
 
       const response = await fetch('/api/scan', {
         method: 'POST',
@@ -327,6 +331,7 @@ export default function Home() {
           target: target.trim(),
           isAuthorized: true,
           scanType,
+          mode: scanMode,
           port: (scanType === 'nikto' || scanType === 'nuclei' || scanType === 'full') ? niktoPort : undefined,
         }),
         signal: controller.signal,
@@ -364,7 +369,7 @@ export default function Home() {
       toast({ title: isTimeout ? 'Scan Timed Out' : 'Scan Failed', description: isTimeout ? 'The scan took too long. Try a faster scan type or check if the target is reachable.' : err instanceof Error ? err.message : 'Failed to start scan', variant: 'destructive' })
       setScanHistory(prev => prev.map(e => e.id === scanId ? { ...e, status: 'failed' as const } : e))
     }
-  }, [target, isAuthorized, scanType, niktoPort])
+  }, [target, isAuthorized, scanType, niktoPort, scanMode])
 
   // Elapsed time display
   const [elapsedText, setElapsedText] = useState('')
@@ -591,6 +596,7 @@ export default function Home() {
               <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-400 border-emerald-500/30"><CheckCircle2 className="h-3 w-3 mr-1" />Real Data Only</Badge>
               <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">Nmap + Nikto + Nuclei</Badge>
               <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30"><Sparkles className="h-3 w-3 mr-1" />AI Remediation</Badge>
+              <Badge variant="outline" className="text-xs bg-rose-500/10 text-rose-400 border-rose-500/30"><Zap className="h-3 w-3 mr-1" />Hybrid Deploy</Badge>
             </div>
           </div>
         </div>
@@ -608,6 +614,31 @@ export default function Home() {
                     <Checkbox id="authorization" checked={isAuthorized} onCheckedChange={checked => { setIsAuthorized(checked === true); if (checked) setValidationError('') }} className="mt-0.5 data-[state=checked]:bg-yellow-500 data-[state=checked]:border-yellow-500" />
                     <label htmlFor="authorization" className="text-sm leading-relaxed cursor-pointer select-none">I confirm I have explicit authorization to scan this target. I understand unauthorized scanning is illegal.</label>
                   </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        {/* Deployment Architecture Info */}
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: 0.05 }}>
+          <Card className="border-primary/20 bg-primary/5">
+            <CardContent className="p-4 sm:p-6">
+              <div className="flex items-start gap-3">
+                <Zap className="h-5 w-5 text-primary mt-0.5 shrink-0" />
+                <div className="flex-1 space-y-2">
+                  <h3 className="font-semibold text-primary text-sm">Hybrid Deployment Architecture</h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs text-muted-foreground">
+                    <div className="flex items-start gap-2">
+                      <div className="w-6 h-6 rounded-full bg-primary/20 flex items-center justify-center shrink-0 mt-0.5"><span className="text-primary font-bold text-xs">1</span></div>
+                      <div><span className="font-medium text-foreground">Frontend &rarr; Vercel</span><br />Your UI (Next.js) — Scan button, results, AI remediation</div>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <div className="w-6 h-6 rounded-full bg-amber-500/20 flex items-center justify-center shrink-0 mt-0.5"><span className="text-amber-400 font-bold text-xs">2</span></div>
+                      <div><span className="font-medium text-foreground">Scanner &rarr; GitHub Actions</span><br />Runs on Ubuntu — Nmap, Nikto, Nuclei (via <code className="bg-muted px-1 rounded">go install</code>)</div>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">Choose <strong>Local</strong> if scanners are installed on your server, or <strong>Hybrid (GitHub Actions)</strong> for cross-platform scanning on Ubuntu runners. Results post back automatically.</p>
                 </div>
               </div>
             </CardContent>
@@ -649,6 +680,28 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+                {/* Deployment Mode selector */}
+                <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-sm font-medium text-muted-foreground">Deployment:</span>
+                    <Select value={scanMode} onValueChange={(v) => setScanMode(v as 'local' | 'hybrid')}>
+                      <SelectTrigger className="w-[260px]"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="local">
+                          <span className="flex items-center gap-2"><Server className="h-3.5 w-3.5" />Local (Direct Binary)</span>
+                        </SelectItem>
+                        <SelectItem value="hybrid">
+                          <span className="flex items-center gap-2"><Zap className="h-3.5 w-3.5" />Hybrid (GitHub Actions)</span>
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {scanMode === 'hybrid' && (
+                    <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30">
+                      <Zap className="h-3 w-3 mr-1" />Scans run on Ubuntu via GitHub Actions
+                    </Badge>
+                  )}
+                </div>
                 {/* Target + scan button */}
                 <div className="flex flex-col sm:flex-row gap-3">
                   <div className="flex-1">
@@ -664,7 +717,9 @@ export default function Home() {
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Info className="h-3.5 w-3.5 shrink-0" />
-                  {scanType === 'full' ? (
+                  {scanMode === 'hybrid' ? (
+                    <span>Hybrid mode: Scan dispatched to GitHub Actions (Ubuntu runner). Nuclei installed via <code className="bg-muted px-1 py-0.5 rounded">go install</code>. Results post back automatically.</span>
+                  ) : scanType === 'full' ? (
                     <span>Full scan runs all 3 engines in parallel — Nmap (ports), Nikto (web), Nuclei (templates) — and calculates a security score.</span>
                   ) : scanType === 'nikto' ? (
                     <span>Scan uses <code className="bg-muted px-1 py-0.5 rounded">nikto -h target -Format csv -C all</code> — Web vulnerability scanner, 100% real data.</span>
@@ -677,6 +732,11 @@ export default function Home() {
                 {/* Engine description badge */}
                 <div className="flex items-center gap-2">
                   <Badge variant="outline" className="text-xs bg-primary/10 text-primary border-primary/30">{scanEngineDesc}</Badge>
+                  {scanMode === 'hybrid' && (
+                    <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-400 border-amber-500/30">
+                      <Zap className="h-3 w-3 mr-1" />GitHub Actions
+                    </Badge>
+                  )}
                 </div>
               </div>
             </CardContent>

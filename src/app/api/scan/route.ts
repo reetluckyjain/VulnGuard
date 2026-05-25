@@ -211,7 +211,8 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
   const xmlFile = join(TMP_DIR, `${scanId}.xml`);
 
   const homeDir = process.env.HOME || "/root";
-  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
+  const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
+  const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
 
   // Fast nmap scan: service version detection on top 100 ports only
   // NO --script vuln (too slow, causes 5-10 min hangs)
@@ -305,7 +306,9 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
   const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
 
   const homeDir = process.env.HOME || "/root";
-  const envPath = `${homeDir}/.local/bin:${process.env.PATH || ""}`;
+  // Include Go bin path for nuclei installed via `go install`
+  const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
+  const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
   const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${homeDir}/nuclei-templates`;
 
   // Build target URL
@@ -321,7 +324,7 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
   }
 
   // Use limited templates for speed (don't scan ALL templates)
-  // Removed -ot (omit-template) and -no-strict-syntax for v3.8.0 compatibility
+  // Nuclei v3.8.0 compatible — installed via `go install`
   const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -timeout 5 -c 10 -rl 50 -retries 1 -t "${templatesDir}/http/cves/" -t "${templatesDir}/http/vulnerabilities/" -t "${templatesDir}/http/exposures/" -t "${templatesDir}/http/misconfiguration/"`;
 
   try {
@@ -1101,32 +1104,113 @@ export async function POST(request: NextRequest) {
     }
 
     const effectiveScanType = resolveScanType(scanType || "nmap");
-    const scanId = uuidv4();
+    let scanId = uuidv4();
     const scanPort = port || "80";
 
-    // Check tool availability
-    const toolName = effectiveScanType === "full" ? "nmap" : effectiveScanType;
-    const toolAvailable = await checkToolAvailable(toolName);
+    // Check if hybrid mode (GitHub Actions) is configured
+    const isHybridMode = (body as Record<string, unknown>).mode === "hybrid" &&
+      !!(process.env.GITHUB_TOKEN && process.env.GITHUB_REPO);
 
-    if (!toolAvailable) {
-      // Try shell script fallback (Linux only)
-      const { resolve: pathResolve } = await import("path");
-      const scriptMap: Record<string, string> = {
-        nuclei: "run-nuclei-scan.sh",
-        nikto: "run-nikto-scan.sh",
-        nmap: "run-nmap-scan.sh",
-        full: "run-full-scan.sh",
-      };
-      const scriptFile = scriptMap[effectiveScanType];
-      const scriptPath = pathResolve(process.cwd(), scriptFile);
+    if (isHybridMode) {
+      // Hybrid mode: dispatch to GitHub Actions
+      const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+      const GITHUB_REPO = process.env.GITHUB_REPO;
+      const CALLBACK_URL = process.env.CALLBACK_URL || process.env.NEXT_PUBLIC_CALLBACK_URL;
+      const CALLBACK_SECRET = process.env.CALLBACK_SECRET || process.env.VULNGUARD_CALLBACK_SECRET || uuidv4();
 
-      if (!existsSync(scriptPath)) {
-        return NextResponse.json({
-          error: `${toolName} is not installed or not in PATH. Please install it to use the ${effectiveScanType} scanner. On Windows: install via choco install ${toolName} or download from official site. On Linux: sudo apt install ${toolName}.`,
+      // Create DB record
+      await db.scan.create({
+        data: { id: scanId, target: targetTrimmed, scanType: effectiveScanType, status: "Running", mode: "hybrid" },
+      });
+
+      const baseUrl = CALLBACK_URL || process.env.NEXT_PUBLIC_APP_URL || "https://your-app.vercel.app";
+      const fullCallbackUrl = `${baseUrl}/api/scan/callback`;
+
+      const dispatchUrl = `https://api.github.com/repos/${GITHUB_REPO}/dispatches`;
+      const dispatchPayload = {
+        event_type: "vulnscan",
+        client_payload: {
+          scan_id: scanId,
           scan_type: effectiveScanType,
           target: targetTrimmed,
-        }, { status: 501 });
+          port: scanPort,
+          callback_url: fullCallbackUrl,
+          callback_secret: CALLBACK_SECRET,
+        },
+      };
+
+      console.log(`[API] Dispatching hybrid scan: ${scanId} (${effectiveScanType}) for ${targetTrimmed}`);
+
+      try {
+        const dispatchResponse = await fetch(dispatchUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${GITHUB_TOKEN}`,
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+            "User-Agent": "VulnGuard-Scanner",
+          },
+          body: JSON.stringify(dispatchPayload),
+        });
+
+        if (!dispatchResponse.ok) {
+          const errorText = await dispatchResponse.text();
+          console.error(`[API] GitHub dispatch error: ${dispatchResponse.status}`, errorText);
+
+          await db.scan.update({
+            where: { id: scanId },
+            data: { status: "Failed", results: JSON.stringify({ error: `GitHub Actions dispatch failed (HTTP ${dispatchResponse.status}). Check GITHUB_TOKEN and GITHUB_REPO.` }) },
+          });
+
+          return NextResponse.json({
+            error: `Failed to dispatch scan to GitHub Actions (HTTP ${dispatchResponse.status}). Verify GITHUB_TOKEN has repo scope.`,
+            scan_id: scanId,
+          }, { status: 502 });
+        }
+
+        // Return immediately — results will come via callback
+        return NextResponse.json({
+          scan_id: scanId,
+          target: targetTrimmed,
+          scan_type: effectiveScanType,
+          status: "Running",
+          mode: "hybrid",
+          message: "Scan dispatched to GitHub Actions. Results will be available once the workflow completes.",
+        }, { status: 201 });
+
+      } catch (dispatchError) {
+        const errMsg = dispatchError instanceof Error ? dispatchError.message : "Dispatch failed";
+        await db.scan.update({
+          where: { id: scanId },
+          data: { status: "Failed", results: JSON.stringify({ error: errMsg }) },
+        });
+        return NextResponse.json({ error: errMsg, scan_id: scanId }, { status: 500 });
       }
+    }
+
+    // Local mode — check tool availability
+    const toolName = effectiveScanType === "full" ? "nmap" : effectiveScanType;
+    const homeDir = process.env.HOME || "/root";
+    const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
+    const envPath = `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
+    let toolAvailable = false;
+    try {
+      const whichCmd = `which ${toolName} 2>/dev/null || ls ${homeDir}/.local/bin/${toolName} 2>/dev/null || ls ${goBinDir}/${toolName} 2>/dev/null`;
+      await execWithTimeout(whichCmd, 5000, {
+        env: { ...process.env, PATH: envPath, HOME: homeDir },
+      });
+      toolAvailable = true;
+    } catch {
+      toolAvailable = false;
+    }
+
+    if (!toolAvailable) {
+      return NextResponse.json({
+        error: `${toolName} is not installed or not in PATH. Install it or switch to Hybrid Mode (GitHub Actions) in the scan configuration.`,
+        scan_type: effectiveScanType,
+        target: targetTrimmed,
+        hint: "Set GITHUB_TOKEN and GITHUB_REPO env vars to enable GitHub Actions hybrid mode.",
+      }, { status: 501 });
     }
 
     // Create DB record

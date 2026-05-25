@@ -11,7 +11,7 @@
 [![Prisma](https://img.shields.io/badge/Prisma-6-2D3748?logo=prisma)](https://www.prisma.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
-[Features](#-features) · [Run Locally](#-run-locally) · [Deployment](#-docker-deployment) · [API Reference](#-api-reference) · [Legal](#%EF%B8%8F-legal-disclaimer)
+[Features](#-features) · [Run Locally](#-run-locally) · [Hybrid Deploy](#-hybrid-deployment-architecture) · [Deployment](#-docker-deployment) · [API Reference](#-api-reference) · [Legal](#%EF%B8%8F-legal-disclaimer)
 
 </div>
 
@@ -109,6 +109,192 @@ Built for security engineers, penetration testers, and devops teams who need a s
 3. **Frontend polls for results** → `GET /api/scan/[id]` checks the status file. When the scan completes, the API reads the output file, parses it (XML/CSV/JSONL), persists structured JSON to the database, and returns it.
 4. **Full Scan mode** → `run-full-scan.sh` spawns all 3 engines in parallel. Each writes its own status file. When all 3 complete, the API merges results, computes a security score, and returns a unified report.
 5. **AI remediation on demand** → `POST /api/remediate` sends structured findings (from any scan type including Full Scan) to an LLM which returns prioritized, actionable remediation guidance with fix commands.
+
+---
+
+## 🌐 Hybrid Deployment Architecture
+
+VulnGuard supports **two deployment modes** — Local (scanner tools on the same server) and Hybrid (frontend on Vercel, scanner on GitHub Actions). Hybrid mode lets you run the UI on a serverless platform while offloading heavy scanning to GitHub's CI infrastructure.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Hybrid Deployment Mode                          │
+│                                                                      │
+│  ┌─────────────────────────────┐   ┌──────────────────────────────┐ │
+│  │       Vercel (Frontend)      │   │   GitHub Actions (Scanner)   │ │
+│  │                              │   │                              │ │
+│  │  ┌──────────────────────┐   │   │  ┌────────────────────────┐  │ │
+│  │  │  Next.js UI          │   │   │  │  ubuntu-latest runner  │  │ │
+│  │  │  · Scan Form         │   │   │  │                        │  │ │
+│  │  │  · Results View      │   │   │  │  · nmap (apt)          │  │ │
+│  │  │  · AI Remediation    │   │   │  │  · nikto (apt)         │  │ │
+│  │  └──────────┬───────────┘   │   │  │  · nuclei (go install) │  │ │
+│  │             │                │   │  │                        │  │ │
+│  │  ┌──────────▼───────────┐   │   │  └───────────┬────────────┘  │ │
+│  │  │  /api/scan           │   │   │              │               │ │
+│  │  │  mode=hybrid         │──┼───┼──► dispatch ──┤               │ │
+│  │  └──────────┬───────────┘   │   │     repo_dispatch            │ │
+│  │             │                │   │              │               │ │
+│  │  ┌──────────▼───────────┐   │   │  ┌───────────▼────────────┐  │ │
+│  │  │  /api/scan/callback  │◄──┼───┼──┤  curl POST results     │  │ │
+│  │  │  (receives results)  │   │   │  └────────────────────────┘  │ │
+│  │  └──────────┬───────────┘   │   │                              │ │
+│  │             │                │   └──────────────────────────────┘ │
+│  │  ┌──────────▼───────────┐   │                                      │
+│  │  │  SQLite (Prisma)     │   │                                      │
+│  │  │  Scan + Schedule     │   │                                      │
+│  │  └──────────────────────┘   │                                      │
+│  └─────────────────────────────┘                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### How Hybrid Mode Works
+
+1. **User initiates scan** — Click "Start Scan" with the Deployment dropdown set to **"Hybrid (GitHub Actions)"**
+2. **API dispatches scan** — Frontend calls `POST /api/scan` with `mode=hybrid`. The API creates a DB record and dispatches a `repository_dispatch` event to the configured GitHub repo
+3. **GitHub Actions runs** — The workflow (`.github/workflows/vulnscan.yml`) triggers on the `vulnscan` event type. It runs on `ubuntu-latest` and installs nmap (apt), nikto (apt), and nuclei (`go install`)
+4. **Scans execute** — All scanner tools run against the target. Nmap scans ports/services, Nikto checks web vulnerabilities, Nuclei runs template-based detection
+5. **Results post back** — GitHub Actions posts the scan results via `curl` to the `/api/scan/callback` endpoint, authenticated with `CALLBACK_SECRET`
+6. **Frontend displays results** — The UI polls `GET /api/scan/[id]` for status updates. When results arrive, they're parsed and displayed with full remediation support
+
+### Local Mode (Default)
+
+Local mode works when all scanner tools are installed directly on the server running VulnGuard. This is the default and simplest deployment — no GitHub Actions or callback configuration needed.
+
+**Requirements:**
+- Nuclei installed via `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest`
+- Both `~/.local/bin` and `~/go/bin` must be in `PATH` so the server can locate scanner binaries
+- Nmap and Nikto installed via system package manager (apt, brew, etc.)
+
+**When to use Local mode:**
+- Running VulnGuard on a VPS or in Docker (all tools bundled)
+- Single-machine deployment where scanner tools are co-located with the web server
+- Simplest setup — no external CI infrastructure needed
+
+**When to use Hybrid mode:**
+- Frontend deployed on Vercel or another serverless platform (no scanner binaries available)
+- Want to leverage GitHub Actions' free CI minutes for scanning
+- Need isolation between the web server and scanner infrastructure
+- Running on a platform where installing nmap/nikto/nuclei isn't possible
+
+### GitHub Actions Workflow
+
+The hybrid mode relies on a GitHub Actions workflow file at `.github/workflows/vulnscan.yml` in the repository specified by `GITHUB_REPO`.
+
+**Key workflow details:**
+
+| Property | Value |
+|---|---|
+| **Trigger** | `repository_dispatch` event type `vulnscan` |
+| **Runner** | `ubuntu-latest` |
+| **nmap** | Installed via `apt-get install nmap` |
+| **nikto** | Installed via `apt-get install nikto` |
+| **nuclei** | Installed via `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| **Results delivery** | `curl POST` to `CALLBACK_URL` with `CALLBACK_SECRET` for authentication |
+
+**Workflow input payload (sent via repository_dispatch):**
+
+```json
+{
+  "event_type": "vulnscan",
+  "client_payload": {
+    "scan_id": "uuid",
+    "target": "scanme.nmap.org",
+    "scan_type": "full",
+    "port": "80",
+    "callback_url": "https://your-app.vercel.app/api/scan/callback",
+    "callback_secret": "your-shared-secret"
+  }
+}
+```
+
+**Creating the workflow file:**
+
+Create `.github/workflows/vulnscan.yml` in your GitHub repository:
+
+```yaml
+name: VulnGuard Scan
+on:
+  repository_dispatch:
+    types: [vulnscan]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
+      SCAN_ID: ${{ github.event.client_payload.scan_id }}
+      TARGET: ${{ github.event.client_payload.target }}
+      SCAN_TYPE: ${{ github.event.client_payload.scan_type }}
+      PORT: ${{ github.event.client_payload.port }}
+      GOPATH: /home/runner/go
+
+    steps:
+      - name: Install scanner tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nmap nikto
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          nuclei -update-templates
+
+      - name: Run scans
+        run: |
+          # Run scan logic here (nmap, nikto, nuclei based on SCAN_TYPE)
+          # Post results back via curl
+          curl -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"results\":{...}}"
+```
+
+> **Note:** The above is a simplified example. The full workflow includes error handling, timeout management, and structured result formatting for all scan types.
+
+### Setting Up Hybrid Deployment
+
+#### Step 1: Deploy Frontend to Vercel
+
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Deploy from project root
+vercel
+
+# Set environment variables in Vercel dashboard or CLI
+vercel env add GITHUB_TOKEN
+vercel env add GITHUB_REPO
+vercel env add CALLBACK_URL
+vercel env add CALLBACK_SECRET
+```
+
+#### Step 2: Prepare the GitHub Repository
+
+1. Create a GitHub repository (or use an existing one)
+2. Add the workflow file at `.github/workflows/vulnscan.yml`
+3. Generate a Personal Access Token with `repo` scope at [github.com/settings/tokens](https://github.com/settings/tokens)
+
+#### Step 3: Configure Environment Variables
+
+Set the following in your Vercel project settings (or `.env` file):
+
+```bash
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_REPO=your-username/vulnguard-scanner
+CALLBACK_URL=https://your-app.vercel.app/api/scan/callback
+CALLBACK_SECRET=your-random-shared-secret
+GOPATH=/home/runner/go
+```
+
+#### Step 4: Test the Hybrid Scan
+
+1. Open the VulnGuard UI on your Vercel deployment
+2. Select **"Hybrid (GitHub Actions)"** from the Deployment dropdown
+3. Enter a target and click **"Start Scan"**
+4. Monitor the GitHub Actions tab in your repository for the running workflow
+5. Results will appear in the UI once the callback posts them back
 
 ---
 
@@ -466,6 +652,18 @@ curl http://localhost:3000/api/scans
 | `PORT` | `3000` | Server port |
 | `NODE_ENV` | `development` | Node environment |
 
+### Hybrid Mode Variables
+
+These environment variables are required **only** when using Hybrid (GitHub Actions) deployment mode. They are not needed for Local mode or Docker deployments.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GITHUB_TOKEN` | — | GitHub Personal Access Token with `repo` scope (used to dispatch workflows) |
+| `GITHUB_REPO` | — | GitHub repository in `owner/repo` format (must contain `.github/workflows/vulnscan.yml`) |
+| `CALLBACK_URL` | — | Public URL where GitHub Actions can post scan results back (e.g., `https://your-app.vercel.app/api/scan/callback`) |
+| `CALLBACK_SECRET` | — | Shared secret for callback authentication — must match between the API and the GitHub Actions workflow |
+| `GOPATH` | — | Go binary path for nuclei installed via `go install` on the GitHub Actions runner (typically `/home/runner/go`) |
+
 ---
 
 ## 📁 Project Structure
@@ -573,7 +771,7 @@ The Dockerfile uses a **3-stage build**:
 
 VulnGuard includes ready-made configuration files for three platforms. All use the Dockerfile for a self-contained deployment with all scanner tools included.
 
-> **⚠️ Important:** VulnGuard uses **SQLite**, which requires a persistent filesystem. Serverless platforms (Vercel, Netlify) are NOT compatible — use container-based platforms instead.
+> **⚠️ Important:** VulnGuard uses **SQLite**, which requires a persistent filesystem. For **Local mode** (scanner tools on the same server), serverless platforms like Vercel and Netlify are NOT compatible — use container-based platforms instead. However, you **can** deploy to Vercel using **Hybrid mode**, which offloads scanning to GitHub Actions. See the [Hybrid Deployment Architecture](#-hybrid-deployment-architecture) section for details.
 
 ### Fly.io
 
@@ -1071,7 +1269,10 @@ PORT=3001 bun run dev
 ## ❓ FAQ
 
 **Q: Can I deploy this on Vercel?**
-A: No. VulnGuard uses SQLite which requires a persistent filesystem, and needs scanner binaries (nmap, nikto, nuclei) installed on the host. Use container-based platforms like Fly.io, Railway, or Render instead.
+A: Yes — with Hybrid mode! Use the **Hybrid (GitHub Actions)** deployment: the Next.js frontend runs on Vercel while scans execute on GitHub Actions infrastructure. The original Local mode still requires a persistent filesystem and scanner binaries on the host, so use container-based platforms (Fly.io, Railway, Render) for that mode.
+
+**Q: What's the difference between Local and Hybrid mode?**
+A: **Local mode** runs scanner tools (nmap, nikto, nuclei) directly on the same server as the web app — simplest setup, works in Docker or on a VPS. **Hybrid mode** splits the architecture: the frontend runs on Vercel (or any serverless platform) and dispatches scans to GitHub Actions, which runs the scanner tools on `ubuntu-latest` runners and posts results back via a callback API endpoint.
 
 **Q: Does it work without root/sudo?**
 A: Yes! Nmap uses `-sT` (TCP connect scan) which doesn't require elevated privileges. Nikto and Nuclei also work without root.

@@ -13,6 +13,8 @@ model Scan {
   scanType  String   @default("nmap")
   status    String   @default("Pending")
   results   String?
+  mode      String   @default("local")  // "local" or "hybrid" (GitHub Actions)
+  githubRunId String?  // GitHub Actions run ID (hybrid mode)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }

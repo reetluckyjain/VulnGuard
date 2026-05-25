@@ -1,0 +1,268 @@
+# VulnGuard — Hybrid Scanner Workflow
+# Triggered by repository_dispatch from the VulnGuard frontend
+# Runs on Ubuntu with real scanner tools (nmap, nikto, nuclei)
+# Posts results back to the VulnGuard callback API
+
+name: VulnGuard Scan
+
+on:
+  repository_dispatch:
+    types: [vulnscan]
+
+permissions:
+  contents: read
+
+env:
+  SCAN_ID: ${{ github.event.client_payload.scan_id }}
+  SCAN_TYPE: ${{ github.event.client_payload.scan_type }}
+  TARGET: ${{ github.event.client_payload.target }}
+  PORT: ${{ github.event.client_payload.port || '80' }}
+  CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+  CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Log scan parameters
+        run: |
+          echo "=== VulnGuard Hybrid Scan ==="
+          echo "Scan ID: $SCAN_ID"
+          echo "Scan Type: $SCAN_TYPE"
+          echo "Target: $TARGET"
+          echo "Port: $PORT"
+
+      - name: Install scanner tools
+        run: |
+          # Nmap
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nmap
+
+          # Nikto
+          sudo apt-get install -y -qq nikto
+
+          # Nuclei (via Go install)
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          # Verify installations
+          nmap --version | head -1
+          nikto -Version 2>&1 | head -3
+          nuclei -version 2>&1 | head -1
+
+      - name: Install Nuclei templates
+        run: |
+          nuclei -update-templates 2>&1 | tail -3
+          echo "NUCLEI_TEMPLATES_DIR=$HOME/nuclei-templates" >> $GITHUB_ENV
+
+      - name: Run Nmap scan
+        if: env.SCAN_TYPE == 'nmap' || env.SCAN_TYPE == 'full'
+        run: |
+          SCAN_ID="${SCAN_ID}"
+          TARGET="${TARGET}"
+          XML_FILE="/tmp/vulnguard-${SCAN_ID}-nmap.xml"
+
+          echo "Running nmap scan against ${TARGET}..."
+          nmap -sT -sV -F --top-ports 100 --max-retries 1 --host-timeout 30s --min-rate 100 -oX "${XML_FILE}" "${TARGET}" || true
+
+          if [ -f "${XML_FILE}" ]; then
+            echo "nmap output saved to ${XML_FILE}"
+            echo "NMAP_XML_FILE=${XML_FILE}" >> $GITHUB_ENV
+          else
+            echo "nmap produced no output"
+          fi
+
+      - name: Run Nikto scan
+        if: env.SCAN_TYPE == 'nikto' || env.SCAN_TYPE == 'full'
+        run: |
+          SCAN_ID="${SCAN_ID}"
+          TARGET="${TARGET}"
+          PORT="${PORT}"
+          CSV_FILE="/tmp/vulnguard-${SCAN_ID}-nikto.csv"
+
+          if [ "$PORT" = "443" ]; then
+            NIKTO_TARGET="https://${TARGET}:${PORT}"
+          else
+            NIKTO_TARGET="http://${TARGET}:${PORT}"
+          fi
+
+          echo "Running nikto scan against ${NIKTO_TARGET}..."
+          nikto -h "${NIKTO_TARGET}" -Format csv -o "${CSV_FILE}" -nointeractive -C all -maxtime 60s || true
+
+          if [ -f "${CSV_FILE}" ]; then
+            echo "nikto output saved to ${CSV_FILE}"
+            echo "NIKTO_CSV_FILE=${CSV_FILE}" >> $GITHUB_ENV
+          else
+            echo "nikto produced no output"
+          fi
+
+      - name: Run Nuclei scan
+        if: env.SCAN_TYPE == 'nuclei' || env.SCAN_TYPE == 'full'
+        run: |
+          SCAN_ID="${SCAN_ID}"
+          TARGET="${TARGET}"
+          PORT="${PORT}"
+          JSONL_FILE="/tmp/vulnguard-${SCAN_ID}-nuclei.jsonl"
+          TEMPLATES_DIR="${NUCLEI_TEMPLATES_DIR:-$HOME/nuclei-templates}"
+
+          # Build target URL
+          if echo "${TARGET}" | grep -qE '^https?://'; then
+            SCAN_URL="${TARGET}"
+          elif [ "$PORT" = "443" ]; then
+            SCAN_URL="https://${TARGET}"
+          elif [ "$PORT" != "80" ] && [ -n "$PORT" ]; then
+            SCAN_URL="http://${TARGET}:${PORT}"
+          else
+            SCAN_URL="http://${TARGET}"
+          fi
+
+          echo "Running nuclei scan against ${SCAN_URL}..."
+          nuclei -u "${SCAN_URL}" -jle "${JSONL_FILE}" -silent -timeout 5 -c 10 -rl 50 -retries 1 \
+            -t "${TEMPLATES_DIR}/http/cves/" \
+            -t "${TEMPLATES_DIR}/http/vulnerabilities/" \
+            -t "${TEMPLATES_DIR}/http/exposures/" \
+            -t "${TEMPLATES_DIR}/http/misconfiguration/" || true
+
+          if [ ! -f "${JSONL_FILE}" ]; then
+            touch "${JSONL_FILE}"
+          fi
+
+          echo "nuclei output saved to ${JSONL_FILE}"
+          echo "NUCLEI_JSONL_FILE=${JSONL_FILE}" >> $GITHUB_ENV
+
+      - name: Package and post results
+        if: always()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
+        run: |
+          #!/bin/bash
+          set -e
+
+          SCAN_ID="${SCAN_ID}"
+          SCAN_TYPE="${SCAN_TYPE}"
+          TARGET="${TARGET}"
+          PORT="${PORT}"
+
+          echo "Packaging results for scan ${SCAN_ID}..."
+
+          # Create results JSON
+          RESULTS_JSON="{}"
+
+          if [ "$SCAN_TYPE" = "nmap" ] || [ "$SCAN_TYPE" = "full" ]; then
+            if [ -n "${NMAP_XML_FILE}" ] && [ -f "${NMAP_XML_FILE}" ]; then
+              NMAP_CONTENT=$(cat "${NMAP_XML_FILE}" | python3 -c "
+          import sys, json, re
+
+          xml = sys.stdin.read()
+          ports = []
+          vulns = []
+
+          port_re = re.compile(r'<port\s+protocol=\"([^\"]*)\"\s+portid=\"(\d+)\">([\s\S]*?)</port>')
+          for m in port_re.finditer(xml):
+              proto, port_id, block = m.group(1), int(m.group(2)), m.group(3)
+              state_m = re.search(r'<state\s+state=\"([^\"]*)\"', block)
+              state = state_m.group(1) if state_m else 'unknown'
+              svc_m = re.search(r'<service\s+([^>]*?)(?:/|>)', block)
+              service, version = 'unknown', 'Unknown'
+              if svc_m:
+                  attrs = svc_m.group(1)
+                  service = re.search(r'name=\"([^\"]*)\"', attrs)
+                  service = service.group(1) if service else 'unknown'
+                  parts = []
+                  for field in ['product', 'version', 'extrainfo']:
+                      fm = re.search(field + r'=\"([^\"]*)\"', attrs)
+                      if fm: parts.append(fm.group(1))
+                  version = ' '.join(parts) if parts else 'Unknown'
+              ports.append({'port_id': port_id, 'protocol': proto, 'state': state, 'service': service, 'version': version})
+
+          print(json.dumps({'target': '${TARGET}', 'ports': ports, 'vulnerabilities': vulns}))
+          " 2>/dev/null || echo "{\"target\":\"${TARGET}\",\"ports\":[],\"vulnerabilities\":[]}")
+              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
+          import sys, json
+          results = json.loads(sys.stdin.read())
+          nmap_data = json.loads('''${NMAP_CONTENT}''')
+          results['nmap'] = nmap_data
+          print(json.dumps(results))
+          " 2>/dev/null || echo "$RESULTS_JSON")
+            fi
+          fi
+
+          if [ "$SCAN_TYPE" = "nikto" ] || [ "$SCAN_TYPE" = "full" ]; then
+            if [ -n "${NIKTO_CSV_FILE}" ] && [ -f "${NIKTO_CSV_FILE}" ]; then
+              NIKTO_BASE64=$(base64 -w0 "${NIKTO_CSV_FILE}")
+              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
+          import sys, json, base64
+          results = json.loads(sys.stdin.read())
+          csv_b64 = '${NIKTO_BASE64}'
+          csv_data = base64.b64decode(csv_b64).decode('utf-8')
+          results['nikto_raw'] = csv_data
+          print(json.dumps(results))
+          " 2>/dev/null || echo "$RESULTS_JSON")
+            fi
+          fi
+
+          if [ "$SCAN_TYPE" = "nuclei" ] || [ "$SCAN_TYPE" = "full" ]; then
+            if [ -n "${NUCLEI_JSONL_FILE}" ] && [ -f "${NUCLEI_JSONL_FILE}" ]; then
+              NUCLEI_BASE64=$(base64 -w0 "${NUCLEI_JSONL_FILE}")
+              RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
+          import sys, json, base64
+          results = json.loads(sys.stdin.read())
+          jsonl_b64 = '${NUCLEI_BASE64}'
+          jsonl_data = base64.b64decode(jsonl_b64).decode('utf-8')
+          results['nuclei_raw'] = jsonl_data
+          print(json.dumps(results))
+          " 2>/dev/null || echo "$RESULTS_JSON")
+            fi
+          fi
+
+          # Build callback payload
+          CALLBACK_PAYLOAD=$(python3 -c "
+          import json
+          payload = {
+              'scan_id': '${SCAN_ID}',
+              'scan_type': '${SCAN_TYPE}',
+              'target': '${TARGET}',
+              'port': '${PORT}',
+              'status': 'Completed',
+              'results': json.loads('''${RESULTS_JSON}'''),
+              'callback_secret': '${CALLBACK_SECRET}'
+          }
+          print(json.dumps(payload))
+          " 2>/dev/null)
+
+          if [ -z "$CALLBACK_PAYLOAD" ]; then
+            # Fallback: simpler payload
+            CALLBACK_PAYLOAD="{\"scan_id\":\"${SCAN_ID}\",\"scan_type\":\"${SCAN_TYPE}\",\"target\":\"${TARGET}\",\"port\":\"${PORT}\",\"status\":\"Completed\",\"results\":{},\"callback_secret\":\"${CALLBACK_SECRET}\"}"
+          fi
+
+          # Post results back
+          if [ -n "${CALLBACK_URL}" ]; then
+            echo "Posting results to ${CALLBACK_URL}..."
+            HTTP_CODE=$(curl -s -o /tmp/callback_response.txt -w "%{http_code}" \
+              -X POST "${CALLBACK_URL}" \
+              -H "Content-Type: application/json" \
+              -d "${CALLBACK_PAYLOAD}" \
+              --max-time 30 || echo "000")
+
+            echo "Callback response: HTTP ${HTTP_CODE}"
+            cat /tmp/callback_response.txt 2>/dev/null || true
+          else
+            echo "No callback URL provided. Results:"
+            echo "${CALLBACK_PAYLOAD}" | python3 -m json.tool 2>/dev/null || echo "${CALLBACK_PAYLOAD}"
+          fi
+
+      - name: Report failure
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret }}
+        run: |
+          if [ -n "${CALLBACK_URL}" ]; then
+            curl -s -X POST "${CALLBACK_URL}" \
+              -H "Content-Type: application/json" \
+              -d "{\"scan_id\":\"${SCAN_ID}\",\"scan_type\":\"${SCAN_TYPE}\",\"target\":\"${TARGET}\",\"status\":\"Failed\",\"error\":\"GitHub Actions scan workflow failed\",\"callback_secret\":\"${CALLBACK_SECRET}\"}" \
+              --max-time 30 || true
+          fi
