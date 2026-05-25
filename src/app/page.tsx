@@ -320,9 +320,9 @@ export default function Home() {
     try {
       setScanStatusText(scanMode === 'hybrid'
         ? `Scan dispatched to GitHub Actions — waiting for results...`
-        : `Executing ${scanType} scan — this may take up to 2 minutes...`)
+        : `Executing ${scanType} scan — this may take up to 3 minutes...`)
       const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), scanMode === 'hybrid' ? 600_000 : 180_000) // 10 min for hybrid, 3 min for local
+      const timeoutId = setTimeout(() => controller.abort(), scanMode === 'hybrid' ? 600_000 : 330_000) // 10 min for hybrid, 5.5 min for local (full scan needs 5 min)
 
       const response = await fetch('/api/scan', {
         method: 'POST',

@@ -184,17 +184,42 @@ function execWithTimeout(command: string, timeoutMs: number, options?: Record<st
 
 // ─── Scan Timeout Constants ─────────────────────────────────────────────────
 
-const NMAP_TIMEOUT = 90_000;        // 90 seconds (includes vuln scripts)
-const NIKTO_TIMEOUT = 120_000;      // 120 seconds
-const NUCLEI_TIMEOUT = 90_000;      // 90 seconds (focused templates)
-const FULL_SCAN_TIMEOUT = 180_000;  // 180 seconds (all 3 engines)
+const NMAP_TIMEOUT = 120_000;        // 120 seconds (includes vuln scripts)
+const NIKTO_TIMEOUT = 120_000;       // 120 seconds
+const NUCLEI_TIMEOUT = 180_000;      // 180 seconds (needs time for template compilation)
+const FULL_SCAN_TIMEOUT = 300_000;   // 300 seconds (all 3 engines in parallel)
 
 // ─── Environment Path Setup ─────────────────────────────────────────────────
 
 function getEnvPath(): string {
   const homeDir = process.env.HOME || "/root";
   const goBinDir = process.env.GOPATH ? `${process.env.GOPATH}/bin` : `${homeDir}/go/bin`;
-  return `${homeDir}/.local/bin:${goBinDir}:${process.env.PATH || ""}`;
+  return `${homeDir}/.local/bin:${goBinDir}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`;
+}
+
+// ─── Tool Availability Check ──────────────────────────────────────────────
+
+interface ToolCheck {
+  name: string;
+  available: boolean;
+  path: string;
+}
+
+function checkToolAvailability(toolName: string): ToolCheck {
+  // Check common paths directly (avoids execSync which can cause issues in Next.js)
+  const homeDir = process.env.HOME || "/root";
+  const commonPaths = [
+    `${homeDir}/.local/bin/${toolName}`,
+    `/usr/local/bin/${toolName}`,
+    `/usr/bin/${toolName}`,
+    `${homeDir}/go/bin/${toolName}`,
+  ];
+  for (const p of commonPaths) {
+    if (existsSync(p)) {
+      return { name: toolName, available: true, path: p };
+    }
+  }
+  return { name: toolName, available: false, path: "" };
 }
 
 function getScanEnv(): Record<string, string> {
@@ -214,14 +239,22 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
   const vulnXmlFile = join(TMP_DIR, `${scanId}-vuln.xml`);
   const env = getScanEnv();
 
+  // Check tool availability
+  const toolCheck = checkToolAvailability("nmap");
+  if (!toolCheck.available) {
+    console.error(`[NmapScan] nmap not found! Checked PATH: ${getEnvPath()}`);
+    return { target, ports: [], vulnerabilities: [] };
+  }
+  console.log(`[NmapScan] Using nmap at: ${toolCheck.path}`);
+
   console.log(`[NmapScan] Starting scan for ${target}`);
 
   // Phase 1: Fast service version scan on top 1000 ports
   const fastCmd = `nmap -sT -sV --top-ports 1000 --max-retries 2 --host-timeout 60s --min-rate 100 -oX "${xmlFile}" "${target}"`;
 
   try {
-    await execWithTimeout(fastCmd, NMAP_TIMEOUT, { env });
-    console.log(`[NmapScan] Phase 1 complete (service version scan)`);
+    const phase1 = await execWithTimeout(fastCmd, NMAP_TIMEOUT, { env });
+    console.log(`[NmapScan] Phase 1 complete (service version scan). stderr: ${phase1.stderr.slice(0, 200)}`);
   } catch (e) {
     console.warn(`[NmapScan] Phase 1 error: ${e instanceof Error ? e.message : e}`);
   }
@@ -235,23 +268,37 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
       if (xml.includes("</nmaprun>")) {
         result = parseNmapXml(target, xml);
         console.log(`[NmapScan] Phase 1 parsed: ${result.ports.length} ports, ${result.vulnerabilities.length} vulns`);
+      } else {
+        console.warn(`[NmapScan] Phase 1 XML incomplete (no </nmaprun> tag)`);
       }
     } catch (e) {
       console.warn(`[NmapScan] Phase 1 parse error:`, e);
     }
+  } else {
+    console.warn(`[NmapScan] Phase 1: No XML output file produced`);
   }
 
-  // Phase 2: If open ports found, run vuln scripts on them for CVE detection
-  const openPorts = result.ports.filter(p => p.state.toLowerCase() === "open");
-  if (openPorts.length > 0) {
-    const portList = openPorts.map(p => p.port_id).join(",");
-    console.log(`[NmapScan] Phase 2: Running vuln scripts on open ports: ${portList}`);
+  // Phase 2: If open ports found, run vuln scripts on TOP ports for CVE detection
+  // Limit to top 20 open ports to prevent timeout with vuln scripts
+  const allOpenPorts = result.ports.filter(p => p.state.toLowerCase() === "open");
+  if (allOpenPorts.length > 0) {
+    // Prioritize well-known service ports for vuln scanning
+    const priorityPorts = [80, 443, 22, 21, 25, 110, 143, 993, 995, 3306, 5432, 6379, 27017, 9200, 8080, 8443, 3389, 5900, 445, 139];
+    const sortedOpen = [...allOpenPorts].sort((a, b) => {
+      const aPri = priorityPorts.includes(a.port_id) ? 0 : 1;
+      const bPri = priorityPorts.includes(b.port_id) ? 0 : 1;
+      return aPri - bPri;
+    });
+    const portsToScan = sortedOpen.slice(0, 20); // Max 20 ports for vuln scripts
+    const portList = portsToScan.map(p => p.port_id).join(",");
+    console.log(`[NmapScan] Phase 2: Running vuln scripts on ${portsToScan.length}/${allOpenPorts.length} open ports: ${portList}`);
 
-    const vulnCmd = `nmap -sT -sV --script default,vuln -oX "${vulnXmlFile}" -p ${portList} --max-retries 1 --host-timeout 90s "${target}"`;
+    // Use --script-timeout to prevent individual scripts from hanging
+    const vulnCmd = `nmap -sT -sV --script default,vuln --script-timeout 30s -oX "${vulnXmlFile}" -p ${portList} --max-retries 1 --host-timeout 90s "${target}"`;
 
     try {
-      await execWithTimeout(vulnCmd, NMAP_TIMEOUT, { env });
-      console.log(`[NmapScan] Phase 2 complete (vuln scripts)`);
+      const phase2 = await execWithTimeout(vulnCmd, NMAP_TIMEOUT, { env });
+      console.log(`[NmapScan] Phase 2 complete (vuln scripts). stderr: ${phase2.stderr.slice(0, 200)}`);
     } catch (e) {
       console.warn(`[NmapScan] Phase 2 error: ${e instanceof Error ? e.message : e}`);
     }
@@ -290,9 +337,34 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
               }
             }
           }
+        } else {
+          console.warn(`[NmapScan] Phase 2 XML incomplete (no </nmaprun> tag)`);
         }
       } catch (e) {
         console.warn(`[NmapScan] Phase 2 parse error:`, e);
+      }
+    } else {
+      console.warn(`[NmapScan] Phase 2: No XML output file produced`);
+    }
+  }
+
+  // Also check for CPE data and add as vulnerability hints
+  for (const port of result.ports) {
+    if (port.state.toLowerCase() === "open" && port.version !== "Unknown") {
+      // Extract CPE-like info from version strings for context
+      const cpeHints: string[] = [];
+      if (port.service === "http" || port.service === "https" || port.service === "http-alt") {
+        cpeHints.push(`Web service detected on port ${port.port_id}: ${port.version}`);
+      }
+      if (port.service === "ssh" && port.version) {
+        cpeHints.push(`SSH service on port ${port.port_id}: ${port.version}`);
+      }
+      if (port.service === "mysql" || port.service === "postgresql" || port.service === "redis") {
+        cpeHints.push(`Database service exposed on port ${port.port_id}: ${port.version}`);
+      }
+      // Log hints for context
+      for (const hint of cpeHints) {
+        console.log(`[NmapScan] Service hint: ${hint}`);
       }
     }
   }
@@ -301,7 +373,7 @@ async function runNmapScan(target: string, scanId: string): Promise<NmapScanResu
   try { unlinkSync(xmlFile); } catch {}
   try { unlinkSync(vulnXmlFile); } catch {}
 
-  console.log(`[NmapScan] Final result: ${result.ports.length} ports (${openPorts.length} open), ${result.vulnerabilities.length} vulns`);
+  console.log(`[NmapScan] Final result: ${result.ports.length} ports (${allOpenPorts.length} open), ${result.vulnerabilities.length} vulns`);
   return result;
 }
 
@@ -312,23 +384,32 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
   const csvFile = join(TMP_DIR, `${scanId}-nikto.csv`);
   const env = getScanEnv();
 
+  // Check tool availability
+  const toolCheck = checkToolAvailability("nikto");
+  if (!toolCheck.available) {
+    console.error(`[NiktoScan] nikto not found! Checked PATH: ${getEnvPath()}`);
+    return { target, scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
+  }
+  console.log(`[NiktoScan] Using nikto at: ${toolCheck.path}`);
+
   // Build nikto URL
   const niktoTarget = `http${port === "443" ? "s" : ""}://${target}:${port}`;
 
   // Nikto with extended timeout for thorough scanning
-  const cmd = `nikto -h "${niktoTarget}" -Format csv -o "${csvFile}" -nointeractive -C all -maxtime 90s -Tuning 1234567890`;
+  // -Tuning 1234567890abcde = all test types for maximum coverage
+  const cmd = `nikto -h "${niktoTarget}" -Format csv -o "${csvFile}" -nointeractive -C all -maxtime 90s -Tuning 1234567890abcde`;
 
   console.log(`[NiktoScan] Starting scan for ${niktoTarget}`);
 
   try {
-    await execWithTimeout(cmd, NIKTO_TIMEOUT, {
+    const scanOutput = await execWithTimeout(cmd, NIKTO_TIMEOUT, {
       env: {
         ...env,
         NIKTODIR: `${process.env.HOME || "/root"}/nikto/program`,
         PERL5LIB: `${process.env.HOME || "/root"}/nikto/program`,
       },
     });
-    console.log(`[NiktoScan] Scan complete`);
+    console.log(`[NiktoScan] Scan complete. stderr: ${scanOutput.stderr.slice(0, 200)}`);
   } catch (e) {
     console.warn(`[NiktoScan] Scan error: ${e instanceof Error ? e.message : e}`);
   }
@@ -348,7 +429,7 @@ async function runNiktoScan(target: string, port: string, scanId: string): Promi
   }
 
   try { unlinkSync(csvFile); } catch {}
-  console.log(`[NiktoScan] No results found`);
+  console.log(`[NiktoScan] No CSV results found (target may not have web vulnerabilities or service may be unreachable)`);
   return { target, scanType: "nikto", server: "Unknown", findings: [], vulnerabilities: [], summary: { total: 0, info: 0, low: 0, medium: 0, high: 0 } };
 }
 
@@ -359,6 +440,17 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
   const jsonlFile = join(TMP_DIR, `${scanId}-nuclei.jsonl`);
   const env = getScanEnv();
   const templatesDir = process.env.NUCLEI_TEMPLATES_DIR || `${process.env.HOME || "/root"}/nuclei-templates`;
+
+  // Check tool availability
+  const toolCheck = checkToolAvailability("nuclei");
+  if (!toolCheck.available) {
+    console.error(`[NucleiScan] nuclei not found! Checked PATH: ${getEnvPath()}`);
+    return {
+      target, scanType: "nuclei", findings: [], vulnerabilities: [],
+      summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
+    };
+  }
+  console.log(`[NucleiScan] Using nuclei at: ${toolCheck.path}`);
 
   // Build target URL
   let scanUrl: string;
@@ -372,7 +464,8 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
     scanUrl = `http://${target}`;
   }
 
-  // Check which template directories exist
+  // Check which template directories exist - focused list for faster scans
+  // Use fewer template dirs to avoid timeout during template compilation
   const templateDirs = [
     "http/cves/",
     "http/vulnerabilities/",
@@ -380,36 +473,53 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
     "http/misconfiguration/",
     "http/default-logins/",
     "http/exposed-panels/",
+    "http/technologies/",
   ].filter(dir => existsSync(join(templatesDir, dir)));
 
   const templateArgs = templateDirs.map(d => `-t "${join(templatesDir, d)}"`).join(" ");
 
-  // Focused scan: only medium/high/critical severity, reasonable concurrency
+  if (templateDirs.length === 0) {
+    console.warn(`[NucleiScan] No template directories found at ${templatesDir}!`);
+  }
+
+  // Scan with low+ severity for actionable results (skip info to avoid overload)
   const cmd = `nuclei -u "${scanUrl}" -jle "${jsonlFile}" -silent -timeout 5 -c 25 -rl 100 -retries 1 -severity low,medium,high,critical ${templateArgs}`;
 
   console.log(`[NucleiScan] Starting scan for ${scanUrl} with ${templateDirs.length} template dirs`);
 
   try {
-    await execWithTimeout(cmd, NUCLEI_TIMEOUT, { env });
-    console.log(`[NucleiScan] Scan complete`);
+    const scanOutput = await execWithTimeout(cmd, NUCLEI_TIMEOUT, { env });
+    console.log(`[NucleiScan] Scan complete. stderr: ${scanOutput.stderr.slice(0, 200)}`);
   } catch (e) {
     console.warn(`[NucleiScan] Scan error: ${e instanceof Error ? e.message : e}`);
   }
 
-  // Parse results
+  // Parse results - the JSONL file may or may not exist depending on whether findings were found
   if (!existsSync(jsonlFile)) {
-    try { mkdirSync(TMP_DIR, { recursive: true }); writeFileSync(jsonlFile, ""); } catch {}
+    console.log(`[NucleiScan] No JSONL output file produced (no findings or scan failed)`);
+    return {
+      target, scanType: "nuclei", findings: [], vulnerabilities: [],
+      summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
+    };
   }
 
   try {
     const jsonl = readFileSync(jsonlFile, "utf-8");
+    if (jsonl.trim().length === 0) {
+      try { unlinkSync(jsonlFile); } catch {}
+      console.log(`[NucleiScan] JSONL file is empty (no findings)`);
+      return {
+        target, scanType: "nuclei", findings: [], vulnerabilities: [],
+        summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
+      };
+    }
     const result = parseNucleiJsonl(target, jsonl);
     try { unlinkSync(jsonlFile); } catch {}
     console.log(`[NucleiScan] Parsed: ${result.findings.length} findings, ${result.vulnerabilities.length} vulns`);
     return result;
-  } catch {
+  } catch (e) {
     try { unlinkSync(jsonlFile); } catch {}
-    console.log(`[NucleiScan] No results found`);
+    console.warn(`[NucleiScan] JSONL parse error:`, e);
     return {
       target, scanType: "nuclei", findings: [], vulnerabilities: [],
       summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, withCurlCommand: 0, withExtractedResults: 0 },
@@ -422,6 +532,16 @@ async function runNucleiScan(target: string, port: string, scanId: string): Prom
 async function runFullScan(target: string, port: string, scanId: string): Promise<FullScanResult> {
   console.log(`[FullScan] Starting full scan for ${target}`);
 
+  // Pre-check tool availability
+  const nmapCheck = checkToolAvailability("nmap");
+  const niktoCheck = checkToolAvailability("nikto");
+  const nucleiCheck = checkToolAvailability("nuclei");
+  console.log(`[FullScan] Tool availability: nmap=${nmapCheck.available} (${nmapCheck.path}), nikto=${niktoCheck.available} (${niktoCheck.path}), nuclei=${nucleiCheck.available} (${nucleiCheck.path})`);
+
+  if (!nmapCheck.available && !niktoCheck.available && !nucleiCheck.available) {
+    console.error(`[FullScan] No scan tools available! Cannot run any scans.`);
+  }
+
   // Run all 3 engines in parallel
   const [nmapSettled, niktoSettled, nucleiSettled] = await Promise.allSettled([
     runNmapScan(target, `${scanId}-nmap`),
@@ -433,7 +553,13 @@ async function runFullScan(target: string, port: string, scanId: string): Promis
   const niktoResult = niktoSettled.status === "fulfilled" ? niktoSettled.value : null;
   const nucleiResult = nucleiSettled.status === "fulfilled" ? nucleiSettled.value : null;
 
-  console.log(`[FullScan] Engines completed: nmap=${!!nmapResult}, nikto=${!!niktoResult}, nuclei=${!!nucleiResult}`);
+  // Log failures with reasons
+  if (nmapSettled.status === "rejected") console.error(`[FullScan] Nmap engine failed: ${nmapSettled.reason}`);
+  if (niktoSettled.status === "rejected") console.error(`[FullScan] Nikto engine failed: ${niktoSettled.reason}`);
+  if (nucleiSettled.status === "rejected") console.error(`[FullScan] Nuclei engine failed: ${nucleiSettled.reason}`);
+
+  const enginesCompleted = (nmapResult ? 1 : 0) + (niktoResult ? 1 : 0) + (nucleiResult ? 1 : 0);
+  console.log(`[FullScan] Engines completed: nmap=${!!nmapResult}, nikto=${!!niktoResult}, nuclei=${!!nucleiResult} (${enginesCompleted}/3)`);
 
   // Build unified result
   const securityScore = calculateSecurityScore(nmapResult, niktoResult, nucleiResult);
